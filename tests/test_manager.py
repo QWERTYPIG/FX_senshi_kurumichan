@@ -70,11 +70,27 @@ class ManagerTests(unittest.TestCase):
         self.assertAlmostEqual(record['scores'][0]['score'], -.025)
         archived = self.m.store / 'runs' / record['id'] / 'prediction.csv'
         original = archived.read_bytes()
+        self.assertEqual((self.root / 'model/sample/prediction.csv').read_bytes(), original)
         self.m.run_model('sample')
         self.assertEqual(archived.read_bytes(), original)
         self.assertEqual(len(self.m.state['runs']), 2)
         self.assertEqual(Manager(self.root).state['runs'][0]['id'], record['id'])
         self.m.rescore()
+
+    def test_relative_output_is_archived_and_stale_output_is_rejected(self):
+        self.add_model('sample')
+        model = self.root / 'model/sample'
+        (model / 'predict.py').write_text('import os, shutil\nshutil.copyfile(os.environ["MANAGER_TEMPLATE"], "prediction.csv")\n')
+        self.m.run_model('sample')
+        record = self.m.state['runs'][-1]
+        archived = self.m.store / 'runs' / record['id'] / 'prediction.csv'
+        original = archived.read_bytes()
+        (model / 'predict.py').write_text('print("No CSV generated")\n')
+        with self.assertRaisesRegex(ValueError, '未更新'):
+            self.m.run_model('sample')
+        self.assertEqual(self.m.state['runs'][-1]['status'], 'failed')
+        self.assertEqual(archived.read_bytes(), original)
+        self.assertEqual((model / 'prediction.csv').read_bytes(), original)
 
     def test_labels_arriving_later_rescore_the_original_prediction(self):
         self.add_model('sample')

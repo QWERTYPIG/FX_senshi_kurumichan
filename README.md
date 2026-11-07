@@ -27,10 +27,12 @@ Manager 提供以下環境變數（都是絕對路徑）：
 | --- | --- |
 | `MANAGER_ROOT` | repo 路徑 |
 | `MANAGER_DATA_DIR` | 解壓後的 `data/`，含 `market/*.csv`、`global/global_data.csv` |
-| `MANAGER_OUTPUT` | **預測指令必須寫入這個路徑**，每次執行都有獨立 CSV |
+| `MANAGER_OUTPUT` | 模型目錄中的 `prediction.csv` 絕對路徑；也可直接以相對路徑 `prediction.csv` 寫入 |
 | `MANAGER_TEMPLATE` | 本次參考模板，包含正確股票順序與日期 |
 
-既有程式若固定輸出檔名，可將第一行設為 `python predict.py && cp result.csv "$MANAGER_OUTPUT"`。每次都必須成功產生檔案；失敗時不會拿舊檔冒充新預測。CSV 使用 `id,YYYY-MM-DD,...` 格式，股票 ID 與順序必須等同 `model/all_down/all_down.csv` 的 50 支，每格僅接受 0 或 1。
+預測結果寫入 current working directory 的 `prediction.csv`，也就是 `model/<model_name>/prediction.csv`，不是 stdout。Manager 驗證後會複製一份到 `manager_data/runs/<run_id>/prediction.csv` 封存，模型目錄保留最新產出的檔案；stdout 與 stderr 只收進執行 Log。若程式輸出 CSV 到 stdout，可寫 `python predict.py > prediction.csv`，並把其他日誌寫到 stderr。
+
+既有程式若固定輸出其他檔名，可將第一行設為 `python predict.py && cp result.csv "$MANAGER_OUTPUT"`。每次都必須成功建立或更新檔案；指令失敗或檔案未更新時，不會拿舊檔冒充新預測。CSV 使用 `id,YYYY-MM-DD,...` 格式，股票 ID 與順序必須等同 `model/all_down/all_down.csv` 的 50 支，每格僅接受 0 或 1。
 
 目前 Phase 2 場次開放時，模板只含該場次日期；其他時間使用原本的 Phase 1 模板。模板只協助保留格式，模型必須自行避免使用未來資料。`model/all_down/` 已附上可直接執行的範例。若官方更改股票清單，請以最新官方 sample 更新 `model/all_down/all_down.csv` 的 ID 與順序。
 

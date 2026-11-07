@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import queue
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -44,7 +45,6 @@ def unpack(archive, destination):
             digest.update(item.filename.encode())
             digest.update(z.read(item))
         # Build a fresh tree, so files removed upstream do not linger.
-        import shutil
         staging = destination.parent / 'extracting'
         if staging.exists():
             shutil.rmtree(staging)
@@ -255,22 +255,28 @@ class Manager:
         try:
             if len(lines) < 2 or not all(line.strip() for line in lines[:2]):
                 raise ValueError('usage.txt 必須有兩行：預測指令、訓練指令')
+            output = usage.parent / 'prediction.csv'
             env = os.environ.copy()
             env.update(MANAGER_ROOT=str(self.root), MANAGER_DATA_DIR=str(self.root / 'data'),
-                       MANAGER_OUTPUT=str(folder / 'prediction.csv'), MANAGER_TEMPLATE=str(self.template()))
+                       MANAGER_OUTPUT=str(output), MANAGER_TEMPLATE=str(self.template()))
             env['PATH'] = str(Path(sys.executable).parent) + os.pathsep + env.get('PATH', '')
             if train:
                 self.command(lines[1], usage.parent, env, folder / 'run.log')
+            before = output.stat() if output.exists() else None
             self.command(lines[0], usage.parent, env, folder / 'run.log')
-            output = folder / 'prediction.csv'
-            if not output.exists():
-                raise ValueError('模型未建立 MANAGER_OUTPUT 指定的 CSV')
+            if not output.is_file():
+                raise ValueError('模型未建立工作目錄中的 prediction.csv')
+            after = output.stat()
+            if before is not None and (before.st_ino, before.st_mtime_ns, before.st_ctime_ns, before.st_size) == (
+                    after.st_ino, after.st_mtime_ns, after.st_ctime_ns, after.st_size):
+                raise ValueError('模型未更新 prediction.csv，拒絕使用上次的預測')
             payload = parse_csv(output)
             base = parse_csv(self.root / 'model' / 'all_down' / 'all_down.csv')
             if payload['stockIds'] != base['stockIds'] or any(v is None for row in payload['predictions'] for v in row):
                 raise ValueError('預測必須包含模板中依序排列的 50 支股票，且不可留白')
             for date in payload['dates']:
                 datetime.strptime(date, '%Y-%m-%d')
+            shutil.copyfile(output, folder / 'prediction.csv')
             # Timestamp AFTER generation, so training across a deadline cannot count as live.
             record.update(createdAt=now(), status='done')
             record['scores'] = score_prediction(payload, returns(self.root / 'data'), record['createdAt'])
