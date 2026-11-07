@@ -15,7 +15,7 @@ python -m venv .venv
 將模型統一放在 repo 的 `model/` 目錄，例如 `model/my_model/usage.txt`，**前兩行不可空白**：
 
 ```text
-python predict.py --output "$MANAGER_OUTPUT"
+python predict.py
 python train.py
 ```
 
@@ -27,7 +27,6 @@ Manager 提供以下環境變數（都是絕對路徑）：
 | --- | --- |
 | `MANAGER_ROOT` | repo 路徑 |
 | `MANAGER_DATA_DIR` | 解壓後的 `data/`，含 `market/*.csv`、`global/global_data.csv` |
-| `MANAGER_OUTPUT` | 模型目錄中的 `prediction.csv` 絕對路徑；也可直接以相對路徑 `prediction.csv` 寫入 |
 | `MANAGER_TEMPLATE` | 本次參考模板，包含正確股票順序與日期 |
 
 預測結果寫入 current working directory 的 `prediction.csv`，也就是 `model/<model_name>/prediction.csv`，不是 stdout。Manager 驗證後會複製一份到 `manager_data/runs/<run_id>/prediction.csv` 封存，模型目錄保留最新產出的檔案；stdout 與 stderr 只收進執行 Log。若程式輸出 CSV 到 stdout，可寫 `python predict.py > prediction.csv`，並把其他日誌寫到 stderr。
