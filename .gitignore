@@ -1,0 +1,9 @@
+.env
+.venv
+.venv/
+script/__pycache__/
+data/
+manager_data/
+data.zip
+**/__pycache__/
+model/*/prediction.csv

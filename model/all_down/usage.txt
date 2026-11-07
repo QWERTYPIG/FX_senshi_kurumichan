@@ -1,0 +1,2 @@
+python predict.py
+python -c "print('All-down baseline: no training required')"
