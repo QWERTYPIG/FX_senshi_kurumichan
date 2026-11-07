@@ -11,15 +11,16 @@ urllib3.disable_warnings(
 ROOT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT_DIR / ".env")
 BASE_URL = "https://140.112.31.182:8444"
-KEY = os.environ["data_access_key"]
 OUTPUT = Path("data.zip")
 
-def download_data():
+def download_data(output=None):
+    output = Path(output) if output is not None else OUTPUT
+    output.parent.mkdir(parents=True, exist_ok=True)
     with requests.Session() as session:
         session.verify = False
         response = session.post(
             f"{BASE_URL}/login",
-            data={"key": KEY},
+            data={"key": os.environ["data_access_key"]},
             timeout=30,
         )
         response.raise_for_status()
@@ -30,7 +31,7 @@ def download_data():
         )
         response.raise_for_status()
 
-        temp = OUTPUT.with_suffix(".zip.part")
+        temp = output.with_suffix(".zip.part")
         try:
             temp.write_bytes(response.content)
 
@@ -39,11 +40,12 @@ def download_data():
                     "not zip"
                 )
 
-            temp.replace(OUTPUT)
+            temp.replace(output)
         finally:
             temp.unlink(missing_ok=True)
 
-        print(f"Downloaded: {OUTPUT}")
+        print(f"Downloaded: {output}")
+        return output
 
 
 if __name__ == "__main__":
