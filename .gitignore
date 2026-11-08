@@ -3,6 +3,7 @@
 .venv/
 script/__pycache__/
 data/
+basic_data/
 manager_data/
 data.zip
 **/__pycache__/

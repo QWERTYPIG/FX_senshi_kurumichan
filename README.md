@@ -35,6 +35,18 @@ Manager 提供以下環境變數（都是絕對路徑）：
 
 目前 Phase 2 場次開放時，模板只含該場次日期；其他時間使用原本的 Phase 1 模板。模板只協助保留格式，模型必須自行避免使用未來資料。`model/all_down/` 已附上可直接執行的範例。若官方更改股票清單，請以最新官方 sample 更新 `model/all_down/all_down.csv` 的 ID 與順序。
 
+## LightGBM baseline
+
+`model/lightgbm_baseline/` 提供基本價量／技術特徵、依日期切分驗證、官方報酬計分與 manager 預測介面。
+
+```sh
+.venv/bin/python -m pip install -r model/lightgbm_baseline/requirements.txt
+.venv/bin/python model/lightgbm_baseline/train.py
+.venv/bin/python model/lightgbm_baseline/predict.py --template /path/to/daily_sample_submission.csv --output model/lightgbm_baseline/prediction.csv
+```
+
+manager 可透過「重新訓練＋預測」使用此模型。預測日期必須晚於訓練截止日；目前資料不足以回測六月開始的 Phase 1 模板，請使用 Phase 2 當日模板。特徵、評估設計、產出檔案與參數詳見 [模型說明](model/lightgbm_baseline/README.md)。
+
 ## 同步、排程與計分
 
 - 台北時間每日 **05:10、22:10** 抓取資料；啟動時立即同步，網頁也可手動觸發。

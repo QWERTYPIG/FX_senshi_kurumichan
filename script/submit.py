@@ -61,25 +61,61 @@ def parse_csv(path: Path):
         "predictions": predictions,
     }
 
-
 def submit(path: Path, phase: int, dry_run=True):
+    if phase not in (1, 2):
+        raise ValueError("Phase must be 1 or 2")
+
+    data = parse_csv(path)
+
+    if phase == 2:
+        # Phase 2: 50 stocks, 1 trading date
+        if len(data["stockIds"]) != 50:
+            raise ValueError("Phase 2 requires 50 stocks")
+
+        if len(data["dates"]) != 1:
+            raise ValueError("Phase 2 requires exactly one date")
+
+        # Convert (50, 1) into (50,)
+        predictions = [
+            row[0] for row in data["predictions"]
+        ]
+
+        if any(
+            type(x) is not int or x not in (0, 1)
+            for x in predictions
+        ):
+            raise ValueError(
+                "Phase 2 predictions must be 0 or 1"
+            )
+
+        data["predictions"] = predictions
+
     payload = {
         "phase": phase,
         "fileName": path.name,
-        "payload": parse_csv(path),
+        "payload": data,
         "note": "",
     }
 
+    # Preview
+    print(json.dumps({
+        "phase": phase,
+        "fileName": path.name,
+        "stockIds": len(data["stockIds"]),
+        "dates": data["dates"],
+        "predictionShape": (
+            [len(data["predictions"]), len(data["dates"])]
+            if phase == 1
+            else [len(data["predictions"])]
+        ),
+        "sample": data["predictions"][:5],
+    }, indent=2, ensure_ascii=False))
+
     if dry_run:
-        print(json.dumps({
-            "phase": phase,
-            "stockIds": len(payload["payload"]["stockIds"]),
-            "dates": len(payload["payload"]["dates"]),
-            "firstRow": payload["payload"]["predictions"][0],
-        }, indent=2))
         print("Dry run: no submission sent")
         return
 
+    # Submit exactly once
     with login() as session:
         response = session.post(
             f"{BASE_URL}/api/submissions",
@@ -90,8 +126,21 @@ def submit(path: Path, phase: int, dry_run=True):
             timeout=30,
         )
 
+        print("Status:", response.status_code)
+
+        try:
+            print(
+                "Response:",
+                json.dumps(
+                    response.json(),
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+            )
+        except ValueError:
+            print("Response:", response.text)
+
         response.raise_for_status()
-        print("Response:", response.text)
 
 
 if __name__ == "__main__":
