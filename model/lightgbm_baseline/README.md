@@ -1,6 +1,7 @@
 # LightGBM baseline
 
-50 支提交股票共用一個二元分類器。標籤依 final.pdf 重新計算為
+全部 100 支股票共用一個二元分類器，驗證、測試與輸出預測針對提交的 50 支。
+標籤依 final.pdf 重新計算為
 `adj_close / adj_open - 1 > 0`，不使用資料中的 `y`。
 
 ## 安裝與訓練
@@ -12,12 +13,25 @@
 .venv/bin/python model/lightgbm_baseline/train.py
 ```
 
-預設讀取 `data/market/` 與 `model/all_down/all_down.csv` 的股票清單。
-訓練與預測都支援 `--data-dir`，預設也會遵守 `MANAGER_DATA_DIR`。
+每次訓練都重新掃描 `basic_data/market/` 與 `data/market/` 的 CSV，使用兩者聯集
+中的全部股票。`model/all_down/all_down.csv`（可用 `--stock-template` 指定）只用來
+決定驗證與輸出的目標股票清單，不限制訓練股票。
+
+`basic_data/market/` 是不變的歷史資料，`data/market/` 是持續更新的資料；先合併
+再排序、計算 rolling 特徵，相同股票與日期由 `data/` 整列覆蓋。更新列若價格無效
+會被排除，不回填成舊版價格。程式不修改這兩份來源。`basic_data/data/` 是舊的
+下載副本，不會遞迴讀入。
+
+訓練與預測都支援 `--history-dir`（預設 `basic_data/`）、`--data-dir`（預設 `data/`，
+也會遵守 `MANAGER_DATA_DIR`）。預設訓練截止日就是本次讀入的最新有效標籤日期，
+不使用固定日期或上一次模型的截止日；`--train-end` 僅供手動限制歷史回測。
+例如今天資料仍只更新到 11/06，截止日就是 11/06；資料更新到 11/09 後，下次訓練
+便會包含 11/09。不同股票缺漏仍依各自有效資料處理。
+
 模型與結果存於本目錄的 `artifacts/`，已排除於 Git：
 
 - `model.txt`：部署用 LightGBM 模型。
-- `metadata.json`：特徵版本、順序、股票清單、資料截止日、超參數、套件版本。
+- `metadata.json`：特徵版本、順序、100 支訓練股票、50 支目標股票、資料來源、列數、日期範圍、超參數、套件版本。
 - `metrics.json`：驗證與測試的 accuracy、官方 score、全漲／全跌分數及每日分數。
 - `test_predictions.csv`：時間切分測試集的機率與實際報酬。
 - `feature_importance.csv`：部署模型的 gain importance。
@@ -41,7 +55,8 @@
 ## 驗證設計
 
 按唯一交易日期排序：最後 7 日為 test、之前 7 日為 validation，其餘為 train，
-同一天的所有股票保持在同一集合。validation 的 binary logloss 用來 early stopping，
+同一天的所有股票保持在同一集合。train 使用全部股票，validation/test 只評估目標
+50 支，validation 的 binary logloss 用來 early stopping，
 閾值固定 0.5；test 不參與訓練或選擇迭代次數。
 
 ```
@@ -51,7 +66,7 @@ score = mean((2 * prediction - 1) * intraday_return)
 評估只對有有效標籤的股票日計算，基準也使用相同股票日；這和 manager
 要求完整 50 支才公布某日分數的規則不同。`metrics.json` 會記錄實際列數。
 
-評估完成後，用已選定的迭代次數在全部允許日期上重新訓練部署模型，包含
+評估完成後，用已選定的迭代次數在全部股票、全部允許日期上重新訓練部署模型，包含
 原本 validation/test。歷史測試成績來自重訓前的模型；不能用部署模型回算
 同一段資料宣稱樣本外績效。反覆根據 test 調整方案後，該段也不再是獨立測試集。
 
@@ -61,8 +76,8 @@ score = mean((2 * prediction - 1) * intraday_return)
 .venv/bin/python model/lightgbm_baseline/train.py --train-end 2026-10-30 --valid-days 5 --test-days 5
 ```
 
-目前資料約 45 個交易日，時間上的獨立樣本很少；第一版結果主要用於確認流程，
-後續應累積資料並增加多段時間回測。
+靜態資料可補回 2020 年起的歷史；預設最後 7 日的測試期間仍很短，
+後續可擴大驗證區間並增加多段時間回測。
 
 ## 預測與 manager
 
@@ -87,13 +102,17 @@ score = mean((2 * prediction - 1) * intraday_return)
 `usage.txt` 執行「重新訓練＋預測」。第一次使用需先訓練；資料同步只會預測，
 不會自動重訓。
 
+預測只載入模板所需的 50 支股票行情，但 categorical 使用保存的完整訓練股票類別，
+維持 100 支訓練與 50 支推論的編碼一致。這次資料合併與股票清單的格式有更新，
+舊模型需先重新訓練一次。
+
 所有預測日期都必須晚於模型的 `trained_through`；歷史評估應查看
 `test_predictions.csv`，或另訓練截止日更早的模型。最新歷史價格距預測日超過
 10 個日曆日會拒絕預測，可用 `--max-history-age-days` 調整。
 
-**repo 預設模板是六月開始的 Phase 1 模板，目前資料從九月開始，不能直接產生
-完整、無洩漏的 Phase 1 預測。** 請使用 Phase 2 當日模板，或備妥更早歷史資料。
-manager 在沒有開放的 Phase 2 場次時會回退到 Phase 1 模板，此時拒絕預測是預期行為。
+manager 在沒有開放的 Phase 2 場次時會回退到六月開始的 Phase 1 模板；用最新資料
+訓練的模型會拒絕這種歷史預測。若要回測 Phase 1，請另指定 `--artifacts-dir`，
+以 `--train-end 2026-05-31` 訓練，再用同一 artifacts 目錄搭配 Phase 1 模板預測。
 
 ## 測試
 
@@ -101,6 +120,7 @@ manager 在沒有開放的 Phase 2 場次時會回退到 Phase 1 模板，此時
 .venv/bin/python -m unittest discover -s model/lightgbm_baseline/tests -v
 ```
 
-涵蓋當日／未來資料修改不影響過去特徵、股票間隔離、下一交易日特徵與無歷史資料。
+涵蓋當日／未來資料修改不影響過去特徵、股票間隔離、下一交易日特徵、無歷史資料、
+靜態與更新資料合併、更新覆蓋、重新讀取最新日期、完整股票類別與模板選擇。
 
 LightGBM API：[官方文件](https://lightgbm.readthedocs.io/en/stable/pythonapi/lightgbm.LGBMClassifier.html)。
