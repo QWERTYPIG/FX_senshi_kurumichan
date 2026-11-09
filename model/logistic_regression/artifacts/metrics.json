@@ -1,0 +1,133 @@
+{
+  "validation": {
+    "rows": 4750,
+    "first_date": "2026-01-02",
+    "last_date": "2026-05-29",
+    "accuracy": 0.5206315789473684,
+    "score": 0.001609186305383298,
+    "return_mae": 0.016174713506612103,
+    "always_up_score": -0.0015498450393899613,
+    "always_down_score": 0.0015498450393899613
+  },
+  "selected_penalty": 0.1,
+  "selection_metric": "validation score",
+  "regularization_trials": [
+    {
+      "penalty": 1e-06,
+      "rows": 4750,
+      "first_date": "2026-01-02",
+      "last_date": "2026-05-29",
+      "accuracy": 0.5256842105263158,
+      "score": 0.0014012840442272358,
+      "return_mae": 0.01617354057320882,
+      "always_up_score": -0.0015498450393899613,
+      "always_down_score": 0.0015498450393899613,
+      "optimizer_iterations": 87
+    },
+    {
+      "penalty": 1e-05,
+      "rows": 4750,
+      "first_date": "2026-01-02",
+      "last_date": "2026-05-29",
+      "accuracy": 0.5256842105263158,
+      "score": 0.0014012840442272358,
+      "return_mae": 0.016173509284474957,
+      "always_up_score": -0.0015498450393899613,
+      "always_down_score": 0.0015498450393899613,
+      "optimizer_iterations": 86
+    },
+    {
+      "penalty": 0.0001,
+      "rows": 4750,
+      "first_date": "2026-01-02",
+      "last_date": "2026-05-29",
+      "accuracy": 0.5256842105263158,
+      "score": 0.0014032116359391721,
+      "return_mae": 0.01617331118732526,
+      "always_up_score": -0.0015498450393899613,
+      "always_down_score": 0.0015498450393899613,
+      "optimizer_iterations": 82
+    },
+    {
+      "penalty": 0.001,
+      "rows": 4750,
+      "first_date": "2026-01-02",
+      "last_date": "2026-05-29",
+      "accuracy": 0.5246315789473684,
+      "score": 0.0013424029985085102,
+      "return_mae": 0.0161727989707612,
+      "always_up_score": -0.0015498450393899613,
+      "always_down_score": 0.0015498450393899613,
+      "optimizer_iterations": 72
+    },
+    {
+      "penalty": 0.01,
+      "rows": 4750,
+      "first_date": "2026-01-02",
+      "last_date": "2026-05-29",
+      "accuracy": 0.5231578947368422,
+      "score": 0.0014524435366084106,
+      "return_mae": 0.016171834112257276,
+      "always_up_score": -0.0015498450393899613,
+      "always_down_score": 0.0015498450393899613,
+      "optimizer_iterations": 38
+    },
+    {
+      "penalty": 0.1,
+      "rows": 4750,
+      "first_date": "2026-01-02",
+      "last_date": "2026-05-29",
+      "accuracy": 0.5206315789473684,
+      "score": 0.001609186305383298,
+      "return_mae": 0.016174713506612103,
+      "always_up_score": -0.0015498450393899613,
+      "always_down_score": 0.0015498450393899613,
+      "optimizer_iterations": 17
+    },
+    {
+      "penalty": 1,
+      "rows": 4750,
+      "first_date": "2026-01-02",
+      "last_date": "2026-05-29",
+      "accuracy": 0.5225263157894737,
+      "score": 0.0016027534133207528,
+      "return_mae": 0.016209801325734758,
+      "always_up_score": -0.0015498450393899613,
+      "always_down_score": 0.0015498450393899613,
+      "optimizer_iterations": 10
+    },
+    {
+      "penalty": 10,
+      "rows": 4750,
+      "first_date": "2026-01-02",
+      "last_date": "2026-05-29",
+      "accuracy": 0.5732631578947368,
+      "score": 0.0014937587166589607,
+      "return_mae": 0.016241964528006518,
+      "always_up_score": -0.0015498450393899613,
+      "always_down_score": 0.0015498450393899613,
+      "optimizer_iterations": 10
+    },
+    {
+      "penalty": 100,
+      "rows": 4750,
+      "first_date": "2026-01-02",
+      "last_date": "2026-05-29",
+      "accuracy": 0.5755789473684211,
+      "score": 0.0015498450393899613,
+      "return_mae": 0.016250569144560117,
+      "always_up_score": -0.0015498450393899613,
+      "always_down_score": 0.0015498450393899613,
+      "optimizer_iterations": 7
+    }
+  ],
+  "training_rows": 77624,
+  "training_last_date": "2026-05-29",
+  "feature_count": 83,
+  "september_predictions_using_pre_september_stock_history": 50,
+  "data_directories": [
+    "/home/Qwertypig/Homework/ML/FinalProject/data",
+    "/home/Qwertypig/Homework/ML/FinalProject/new_data/data"
+  ],
+  "optimizer_iterations": 15
+}

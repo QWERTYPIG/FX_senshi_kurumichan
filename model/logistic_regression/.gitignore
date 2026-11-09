@@ -1,0 +1,8 @@
+artifacts/*
+!artifacts/model.pkl
+!artifacts/metadata.json
+!artifacts/metrics.json
+!artifacts/regularization_search.csv
+prediction.csv
+predictions.csv
+__pycache__/
