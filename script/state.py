@@ -118,6 +118,13 @@ def phase2_availability(state, now=None):
     if isinstance(active, dict):
         schedule = {**schedule, **active}
 
+    # Phase 2 closes at 09:00 Taipei on the session's trading date.
+    # Enforce this even if the API omits a deadline or advertises a later one.
+    deadline = datetime.fromisoformat(date + "T09:00:00").replace(tzinfo=TAIPEI)
+    if schedule.get("deadline"):
+        advertised = datetime.fromisoformat(schedule["deadline"].replace("Z", "+00:00"))
+        deadline = min(deadline, advertised)
+    schedule = {**schedule, "deadline": deadline.isoformat()}
     is_open = bool(schedule.get("enabled", True))
     for field, is_start in (("openAt", True), ("deadline", False)):
         raw = schedule.get(field)

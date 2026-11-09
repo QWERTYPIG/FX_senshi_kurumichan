@@ -8,10 +8,11 @@ import pandas as pd
 MODEL_DIR = Path(__file__).resolve().parent
 ROOT = MODEL_DIR.parents[1]
 DATA_DIR = Path(os.environ.get("MANAGER_DATA_DIR", ROOT / "data"))
+HISTORY_DIR = ROOT / "basic_data"
 # Standalone execution should reuse the manager's latest generated template.
 # The canonical all_down file is a stock-list / Phase 1 reference, not today's template.
 TEMPLATE = Path(os.environ.get("MANAGER_TEMPLATE", ROOT / "manager_data/template.csv"))
-FEATURE_VERSION = 1
+FEATURE_VERSION = 3
 FEATURES = [
     "stock_id", "intraday_lag1", "return_lag1", "range_lag1", "gap_lag1",
     "volume_ratio_5", "return_mean_5", "return_std_5", "return_mean_10",
@@ -30,17 +31,56 @@ def read_template(path):
     return template
 
 
-def stock_features(path):
-    df = pd.read_csv(path, parse_dates=["date"]).sort_values("date")
-    if df.empty or df["date"].isna().any() or df["date"].duplicated().any():
-        raise ValueError(f"Empty, invalid or duplicated dates in {path}")
+def discover_stock_ids(data_dir, history_dir=None):
+    """Discover the full stock universe on every invocation, without a cached list."""
+    directories = [Path(data_dir)]
+    if history_dir is not None:
+        directories.append(Path(history_dir))
+    stocks = set()
+    for directory in directories:
+        market = directory / "market"
+        if not market.is_dir():
+            raise ValueError(f"Missing market directory: {market}")
+        stocks.update(path.stem for path in market.glob("*.csv"))
+    if not stocks:
+        raise ValueError("No stock CSV files found")
+    return sorted(stocks)
+
+
+def load_stock_history(path, history_path=None):
+    """Combine static history with live updates; a live row replaces a static row."""
+    parts = []
+    for source in (history_path, path):
+        if source is None or not source.is_file():
+            continue
+        part = pd.read_csv(source, parse_dates=["date"])
+        if part["date"].isna().any() or part["date"].duplicated().any():
+            raise ValueError(f"Invalid or duplicated dates in {source}")
+        parts.append(part)
+    if not parts:
+        raise ValueError(f"No history found for {path.stem}")
+    return (pd.concat(parts, ignore_index=True).drop_duplicates("date", keep="last")
+            .sort_values("date").reset_index(drop=True))
+
+
+def stock_features(path, history_path=None):
+    df = load_stock_history(path, history_path)
     # Do not use the supplied y column; derive the PDF's target from prices.
     required = ["etl:adj_open", "etl:adj_close", "etl:adj_high", "etl:adj_low",
                 "price:成交股數"]
     for name in required:
         df[name] = pd.to_numeric(df[name], errors="coerce")
-    close = df["etl:adj_close"].where(df["etl:adj_close"] > 0)
-    open_ = df["etl:adj_open"].where(df["etl:adj_open"] > 0)
+
+    # Remove invalid market rows BEFORE computing returns and rolling indicators.
+    # The supplied data uses -1 for missing observations (e.g. 2026-10-23).
+    valid_prices = df[["etl:adj_open", "etl:adj_close", "etl:adj_high", "etl:adj_low"]].gt(0).all(axis=1)
+    valid_volume = df["price:成交股數"].ge(0)
+    df = df.loc[valid_prices & valid_volume].copy().reset_index(drop=True)
+    if df.empty:
+        raise ValueError(f"No valid price history in {path}")
+
+    close = df["etl:adj_close"]
+    open_ = df["etl:adj_open"]
     volume = df["price:成交股數"]
     ret = close.pct_change(fill_method=None)
 
@@ -69,11 +109,13 @@ def stock_features(path):
     return result, labels
 
 
-def build_dataset(data_dir, stock_ids, dates=None):
+def build_dataset(data_dir, stock_ids, dates=None, *, history_dir=None, category_ids=None):
     """Training uses observed target dates; inference can request future dates."""
     frames = []
     for stock_id in stock_ids:
-        source, labels = stock_features(Path(data_dir) / "market" / f"{stock_id}.csv")
+        history_path = (Path(history_dir) / "market" / f"{stock_id}.csv"
+                        if history_dir is not None else None)
+        source, labels = stock_features(Path(data_dir) / "market" / f"{stock_id}.csv", history_path)
         queries = (labels if dates is None else
                    pd.DataFrame({"date": pd.to_datetime(list(dates))}).sort_values("date"))
         joined = pd.merge_asof(
@@ -84,5 +126,8 @@ def build_dataset(data_dir, stock_ids, dates=None):
         joined["weekday"] = joined["date"].dt.day_of_week
         frames.append(joined)
     result = pd.concat(frames, ignore_index=True)
-    result["stock_id"] = pd.Categorical(result["stock_id"], categories=stock_ids)
+    categories = stock_ids if category_ids is None else category_ids
+    if not set(stock_ids).issubset(categories):
+        raise ValueError("Requested stocks are absent from the trained category universe; retrain")
+    result["stock_id"] = pd.Categorical(result["stock_id"], categories=categories)
     return result.sort_values(["date", "stock_id"]).reset_index(drop=True)

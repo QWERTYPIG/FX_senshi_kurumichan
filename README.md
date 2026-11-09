@@ -37,7 +37,7 @@ Manager 提供以下環境變數（都是絕對路徑）：
 
 ## LightGBM baseline
 
-`model/lightgbm_baseline/` 提供基本價量／技術特徵、依日期切分驗證、官方報酬計分與 manager 預測介面。
+`model/lightgbm_baseline/` 合併 `basic_data/market/` 歷史與 `data/market/` 更新資料，用全部 100 支股票訓練，驗證及預測針對目標 50 支；同日重複資料以 `data/` 為準。提供基本價量／技術特徵、依日期切分驗證、官方報酬計分與 manager 預測介面。
 
 ```sh
 .venv/bin/python -m pip install -r model/lightgbm_baseline/requirements.txt
@@ -45,7 +45,7 @@ Manager 提供以下環境變數（都是絕對路徑）：
 .venv/bin/python model/lightgbm_baseline/predict.py --template /path/to/daily_sample_submission.csv --output model/lightgbm_baseline/prediction.csv
 ```
 
-manager 可透過「重新訓練＋預測」使用此模型。預測日期必須晚於訓練截止日；目前資料不足以回測六月開始的 Phase 1 模板，請使用 Phase 2 當日模板。特徵、評估設計、產出檔案與參數詳見 [模型說明](model/lightgbm_baseline/README.md)。
+manager 可透過「重新訓練＋預測」使用此模型。每次訓練重新讀檔，預設涵蓋最新有效行情日期，無須調整固定截止日。預測日期必須晚於訓練截止日；Phase 1 歷史回測需另訓練截止日更早的模型。特徵、評估設計、產出檔案與參數詳見 [模型說明](model/lightgbm_baseline/README.md)。
 
 ## 同步、排程與計分
 
@@ -58,6 +58,10 @@ manager 可透過「重新訓練＋預測」使用此模型。預測日期必須
 - 當日 09:00 前完成的預測列為「即時」，其他列為「歷史回算」。模型卡片的即時成績採每個日期最後一份截止前預測再取日均，不會重複計入同一天。歷史回算不代表樣本外績效，manager 無法驗證模型內部是否有資料洩漏。
 
 ## 提交
+
+Phase 2 若當日有開放場次，截止時間為**該交易日早上 09:00（Asia/Taipei）**，不是晚上。Manager 在 09:00 起停止接受該場次提交；即使 API 缺少截止時間或回報較晚時間，也會套用此限制，官方若提早關閉仍以官方狀態為準。
+
+05:10、22:10 是資料同步時間，不是提交截止時間。自動提交開啟時，05:10 同步後可嘗試提交當日開放場次；22:10 僅能提交當時已開放的後續場次，不會補交當天已截止的場次。
 
 在模型卡片按「選為提交模型」，再按「提交選定模型」。預設關閉自動提交；開啟後，在同步或選定模型完成預測後嘗試自動提交。選擇模型本身只儲存選擇，不會直接送出。
 
