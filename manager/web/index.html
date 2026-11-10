@@ -18,7 +18,7 @@
 <div id="notice" role="status" aria-live="polite"></div>
 <section class="toolbar"><button data-action="refresh">同步資料與預測</button><button class="secondary" data-action="state">更新比賽資訊</button><span id="sync">每日 05:10 / 22:10 · Asia/Taipei</span></section>
 <section class="stats" id="stats" aria-label="比賽資訊"></section>
-<section class="submission"><div><span class="eyebrow">SUBMISSION CONTROL</span><h2 id="selected">尚未選擇提交模型</h2><p>Phase 2 開放場次於交易日當天早上 09:00（台北時間）截止；僅提交目前場次，相同內容不重複送出。</p></div><div class="submit-actions"><label><input id="auto" type="checkbox"> 資料更新後自動提交</label><button id="submit" data-action="submit">提交選定模型</button></div></section>
+<section class="submission"><div><span class="eyebrow">SUBMISSION CONTROL</span><h2 id="selected">尚未選擇提交模型</h2><p>自動提交於每天 08:30 觸發，使用選定模型的最新有效預測；Phase 2 開放場次於當天 09:00 截止（台北時間）。</p></div><div class="submit-actions"><label><input id="auto" type="checkbox"> 每天 08:30 自動提交（台北時間）</label><button class="secondary" data-action="submit-preview">檢查提交（不上傳）</button><button id="submit" data-action="submit">提交選定模型</button></div></section>
 <section><div class="section-head"><h2>模型工作台</h2><span id="model-count"></span></div><div id="models" class="models"></div></section>
 <section><div class="section-head"><h2>預測紀錄與分數</h2><span>分數愈高愈好 · 原始報酬率</span></div><p class="hint">即時績效僅納入當日 09:00 前完成的預測；歷史回算另列，未公開完整價格的日期保持待計分。</p><div class="table-wrap"><table><thead><tr><th>模型 / 時間</th><th>狀態</th><th>即時日均分數</th><th>歷史回算均分</th><th>已計分 / 日期數</th><th>檔案</th></tr></thead><tbody id="runs"></tbody></table></div></section>
 <section><h2>執行動態</h2><ul id="events" class="events"></ul></section>

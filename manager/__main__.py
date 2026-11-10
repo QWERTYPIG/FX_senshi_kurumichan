@@ -60,6 +60,14 @@ def handler_for(manager):
                 body = json.loads(self.rfile.read(size) or b'{}')
                 if not isinstance(body, dict):
                     raise ValueError('JSON object required')
+                if self.path == '/api/submit-preview':
+                    try:
+                        result = manager.submit_selected(dry_run=True)
+                    except ValueError:
+                        raise
+                    except Exception as exc:
+                        return self.reply(502, {'error': f'檢查提交失敗：{exc}'})
+                    return self.reply(200, result)
                 if self.path == '/api/config':
                     manager.configure(body.get('selected'), body.get('autoSubmit'))
                     return self.reply(200, {'ok': True})
