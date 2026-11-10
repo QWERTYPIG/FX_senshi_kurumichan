@@ -11,7 +11,13 @@ async function api(path, body) {
   return data;
 }
 async function action(path, body = {}) {
-  try { await api(path, body); $('#notice').textContent = path === 'config' ? '設定已儲存' : '工作已排入佇列'; await refresh(); }
+  try {
+    const result = await api(path, body);
+    $('#notice').textContent = path === 'submit-preview'
+      ? `檢查通過，未上傳：${result.model} / ${result.tradingDate} / ${result.stocks} 支股票。${result.wouldSubmit ? '檔案可提交。' : '相同預測已有紀錄：' + result.previousStatus}`
+      : path === 'config' ? '設定已儲存' : '工作已排入佇列';
+    await refresh();
+  }
   catch(e) { $('#notice').textContent = e.message; }
 }
 function stat(label, value, detail) { return `<article class="stat"><small>${esc(label)}</small><strong>${esc(value)}</strong><p>${esc(detail)}</p></article>`; }
@@ -19,7 +25,7 @@ function render(s) {
   state = s;
   const c = s.competition || {}, p = c.phase2 || {}, ranks = c.ranks || {}, submissions = c.submissions || {};
   $('#busy').textContent = s.busy ? '執行中 · ' + s.busy : '待命中';
-  $('#sync').textContent = '每日 05:10 / 22:10 · 最近檢查 ' + date(s.lastCheck);
+  $('#sync').textContent = '同步 05:10 / 22:10 · 自動提交 08:30（台北） · 最近檢查 ' + date(s.lastCheck);
   $('#stats').innerHTML = stat('Phase 2 場次', p.tradingDate || '未取得場次', p.deadline ? (p.isOpen ? '截止 ' : '目前未開放 · 截止 ') + date(p.deadline) : '開放交易日當天 09:00（台北時間）截止') + stat('剩餘提交額度', p.remaining ?? '待確認', '選用模型：' + (s.selected || '尚未選擇')) + stat('Phase 1 排名', ranks.phase1?.rank ?? '—', '參賽隊伍 ' + (ranks.phase1?.totalTeams ?? '—')) + stat('Phase 2 模擬總排名', ranks.phase2?.mockFinalRank ?? '—', '累積平均名次 ' + (ranks.phase2?.cumulativeAverageRank ?? '—'));
   $('#selected').textContent = s.selected ? '提交模型 / ' + s.selected : '尚未選擇提交模型';
   $('#auto').checked = s.autoSubmit;

@@ -103,6 +103,8 @@ class Manager:
         (self.store / 'runs').mkdir(exist_ok=True)
         self.lock = threading.RLock()
         self.tasks = queue.Queue(maxsize=32)
+        self.submit_tasks = queue.Queue(maxsize=8)
+        self.submission_lock = threading.Lock()
         self.stop = threading.Event()
         self.state_interval = state_interval
         self.command_timeout = command_timeout
@@ -120,6 +122,7 @@ class Manager:
                     'status': 'failed', 'run': record['id'], 'error': record['error']}
         self.save()
         self.busy = None
+        self.submission_busy = None
         self.pending = set()
 
     def save(self):
@@ -140,9 +143,10 @@ class Manager:
             result = copy.deepcopy(self.state)
             result.pop('rawState', None)
             result['availableModels'] = list(self.discover())
-            result['busy'] = self.busy
+            result['busy'] = self.submission_busy or self.busy
             result['pending'] = sorted(self.pending)
             result['schedule'] = ['05:10', '22:10']
+            result['submissionTime'] = '08:30'
             return result
 
     def enqueue(self, action, model=None):
@@ -152,7 +156,8 @@ class Manager:
         with self.lock:
             if key in self.pending:
                 return False
-            self.tasks.put_nowait((key, action, model))
+            tasks = self.submit_tasks if action in {'submit', 'scheduled-submit'} else self.tasks
+            tasks.put_nowait((key, action, model))
             self.pending.add(key)
         return True
 
@@ -205,8 +210,6 @@ class Manager:
                 except Exception as exc:
                     self.event(f'{name} 執行失敗：{exc}')
         self.event('資料已更新' if changed else '資料內容未變更')
-        if self.state['autoSubmit']:
-            self.submit_selected()
 
     def template(self):
         from submit import parse_csv
@@ -278,12 +281,14 @@ class Manager:
                 datetime.strptime(date, '%Y-%m-%d')
             shutil.copyfile(output, folder / 'prediction.csv')
             # Timestamp AFTER generation, so training across a deadline cannot count as live.
-            record.update(createdAt=now(), status='done')
-            record['scores'] = score_prediction(payload, returns(self.root / 'data'), record['createdAt'])
-            record['dates'] = payload['dates']
+            created_at = now()
+            scores = score_prediction(payload, returns(self.root / 'data'), created_at)
+            with self.lock:
+                record.update(createdAt=created_at, status='done', scores=scores, dates=payload['dates'])
             self.event(f'{name} 預測完成')
         except Exception as exc:
-            record.update(error=str(exc), status='failed')
+            with self.lock:
+                record.update(error=str(exc), status='failed')
             raise
         finally:
             with self.lock:
@@ -301,50 +306,123 @@ class Manager:
                                                         realized, record['createdAt'])
             self.save()
 
-    def submit_selected(self):
+    def submit_selected(self, dry_run=False, trading_date=None):
+        # Manual submissions and the daily timer share a lock and deduplication.
+        with self.submission_lock:
+            return self._submit_selected(dry_run=dry_run, trading_date=trading_date)
+
+    def _submit_selected(self, dry_run=False, trading_date=None):
         from submit import parse_csv, submit
         # Recheck the active session and quota immediately before a real upload.
         self.fetch_state()
-        phase = self.state['competition']['phase2']
+        with self.lock:
+            phase = copy.deepcopy(self.state['competition']['phase2'])
         if phase.get('canSubmit') is not True:
             raise ValueError('目前沒有確認開放且有剩餘額度的 Phase 2 場次')
-        name = self.state['selected']
-        latest = next((r for r in reversed(self.state['runs']) if r['model'] == name), None)
+        if trading_date is not None and phase.get('tradingDate') != trading_date:
+            raise ValueError('08:30 排程僅提交今天的場次，官方目前場次日期不符')
+        with self.lock:
+            name = self.state['selected']
+            latest = copy.deepcopy(next((r for r in reversed(self.state['runs']) if r['model'] == name), None))
+            data_hash = self.state['dataHash']
+        if name is None:
+            raise ValueError('請先選擇提交模型')
         if not latest or latest['status'] != 'done':
             raise ValueError('選定模型沒有成功的最新預測')
-        if latest['dataHash'] != self.state['dataHash']:
+        if latest['dataHash'] != data_hash:
             raise ValueError('模型預測使用舊資料，請先重新產生預測')
         path = self.store / 'runs' / latest['id'] / 'prediction.csv'
         payload = parse_csv(path)
         if payload['dates'] != [phase['tradingDate']]:
             raise ValueError('預測日期必須等於目前 Phase 2 場次日期（僅一欄）')
         key = phase['tradingDate'] + ':' + hashlib.sha256(path.read_bytes()).hexdigest()
-        if any(s['key'] == key for s in self.state['submissions']):
+        previous = next((s for s in self.state['submissions'] if s['key'] == key), None)
+        if dry_run:
+            return {'status': 'dry-run', 'wouldSubmit': previous is None, 'model': name,
+                    'tradingDate': phase['tradingDate'], 'file': str(path),
+                    'stocks': len(payload['stockIds']), 'dates': payload['dates'],
+                    'previousStatus': previous['status'] if previous else None,
+                    'submissionTime': '08:30', 'timezone': 'Asia/Taipei'}
+        if previous:
             self.event('相同日期與預測已提交，略過重複提交')
-            return
+            return previous['status']
         # Save intent first: ambiguous network failure must not trigger automatic duplicates.
         entry = {'key': key, 'at': now(), 'model': name, 'run': latest['id'], 'status': 'sending'}
-        self.state['submissions'].append(entry)
-        self.save()
+        with self.lock:
+            self.state['submissions'].append(entry)
+            if trading_date is not None:
+                self.state['lastScheduledSubmissionDate'] = trading_date
+            self.save()
         try:
             submit(path, 2, dry_run=False)
-            entry['status'] = 'sent'
+            with self.lock:
+                entry['status'] = 'sent'
             self.event(f'{name} 已提交 {phase["tradingDate"]}')
         except Exception as exc:
-            entry.update(status='uncertain', error=str(exc))
+            with self.lock:
+                entry.update(status='uncertain', error=str(exc))
             self.event('提交結果未確認，請至官方網站檢查紀錄；不會自動重送')
             raise
         finally:
             self.save()
+        return entry['status']
 
-    def worker(self):
+    def scheduled_submission_due(self, current):
+        current = current.astimezone(TAIPEI)
+        start = current.replace(hour=8, minute=30, second=0, microsecond=0)
+        deadline = current.replace(hour=9, minute=0, second=0, microsecond=0)
+        with self.lock:
+            return (self.state['autoSubmit'] and self.state['selected'] is not None
+                    and start <= current < deadline
+                    and self.state.get('lastScheduledSubmissionDate') != current.date().isoformat())
+
+    def queue_scheduled_submission(self, current):
+        current = current.astimezone(TAIPEI)
+        if not self.scheduled_submission_due(current):
+            return False
+        if current < getattr(self, '_next_scheduled_attempt', current):
+            return False
+        if self.enqueue('scheduled-submit'):
+            self._next_scheduled_attempt = current + timedelta(minutes=1)
+            self.event('08:30 自動提交已排入佇列')
+            return True
+        return False
+
+    def scheduled_submit(self, current=None):
+        current = (current or datetime.now(TAIPEI)).astimezone(TAIPEI)
+        # Recheck on execution: disable/cancel, queue delay, or deadline may have intervened.
+        if not self.scheduled_submission_due(current):
+            return
+        date = current.date().isoformat()
+        try:
+            status = self.submit_selected(trading_date=date)
+        except Exception:
+            # An ambiguous upload must not be retried with a different CSV after restart.
+            with self.lock:
+                uncertain = any(s['key'].startswith(date + ':') and s['status'] in {'sending', 'uncertain'}
+                                for s in self.state['submissions'])
+                if uncertain:
+                    self.state['lastScheduledSubmissionDate'] = date
+                    self.save()
+            raise
+        with self.lock:
+            self.state['lastScheduledSubmissionDate'] = date
+            self.save()
+        self.event(f'08:30 排程完成：{date}（{status}）')
+
+    def worker(self, tasks=None):
+        tasks = self.tasks if tasks is None else tasks
+        is_submission = tasks is self.submit_tasks
         while not self.stop.is_set():
             try:
-                key, action, name = self.tasks.get(timeout=1)
+                key, action, name = tasks.get(timeout=1)
             except queue.Empty:
                 continue
             with self.lock:
-                self.busy = key
+                if is_submission:
+                    self.submission_busy = key
+                else:
+                    self.busy = key
             try:
                 if action == 'refresh':
                     self.refresh()
@@ -352,23 +430,30 @@ class Manager:
                     self.fetch_state()
                 elif action in {'train', 'predict'}:
                     self.run_model(name, train=action == 'train')
-                    if self.state['autoSubmit'] and self.state['selected'] == name:
-                        self.submit_selected()
+                elif action == 'scheduled-submit':
+                    self.scheduled_submit()
                 elif action == 'submit':
                     self.submit_selected()
             except Exception as exc:
                 self.event(f'{key} 失敗：{exc}')
             finally:
                 with self.lock:
-                    self.busy = None
+                    if is_submission:
+                        self.submission_busy = None
+                    else:
+                        self.busy = None
                     self.pending.discard(key)
-                self.tasks.task_done()
+                tasks.task_done()
 
     def scheduler(self):
         self.enqueue('refresh')
         next_state = time.monotonic() + self.state_interval
         while not self.stop.wait(15):
             current = datetime.now(TAIPEI)
+            try:
+                self.queue_scheduled_submission(current)
+            except queue.Full:
+                self.event('自動提交佇列已滿，稍後重試')
             # Persist scheduled slots, including a same-day catch-up after a restart.
             slots = [current.replace(hour=h, minute=10, second=0, microsecond=0) for h in (5, 22)]
             slot = max((s for s in slots if s <= current), default=None)
@@ -390,3 +475,4 @@ class Manager:
     def start(self):
         for target in (self.worker, self.scheduler):
             threading.Thread(target=target, daemon=True).start()
+        threading.Thread(target=self.worker, args=(self.submit_tasks,), daemon=True).start()
