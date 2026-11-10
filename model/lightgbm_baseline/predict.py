@@ -64,7 +64,7 @@ def main():
     if frame["feature_date"].isna().any() or (age > args.max_history_age_days).any():
         raise ValueError("Missing or stale price history; synchronize data before predicting")
     model = lgb.Booster(model_file=str(args.artifacts_dir / "model.txt"))
-    frame["prediction"] = (model.predict(frame[FEATURES]) >= metadata["threshold"]).astype(int)
+    frame["prediction"] = (model.predict(frame[FEATURES]) > metadata["threshold"]).astype(int)
     lookup = frame.pivot(index="stock_id", columns="date", values="prediction")
     for date in dates:
         template[date] = lookup.loc[stock_ids, pd.Timestamp(date)].to_numpy()

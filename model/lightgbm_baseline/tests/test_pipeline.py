@@ -43,7 +43,8 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
             def train():
-                run("train.py", "--stock-template", str(template), "--valid-days", "3", "--test-days", "3")
+                run("train.py", "--stock-template", str(template), "--valid-days", "3", "--test-days", "3",
+                    "--cv-folds", "2", "--early-stop-days", "3", "--min-train-days", "10")
                 return json.loads((artifacts / "metadata.json").read_text())
 
             first = train()
@@ -57,6 +58,11 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(second["training_rows"], first["training_rows"] + 3)
             metrics = json.loads((artifacts / "metrics.json").read_text())
             self.assertEqual(metrics["test"]["rows"], 6)  # 3 dates x 2 target stocks
+            self.assertEqual(metrics["validation"]["rows"], 12)
+            self.assertEqual(len(metrics["cross_validation"]["folds"]), 2)
+            oof = pd.read_csv(artifacts / "validation_predictions.csv")
+            self.assertFalse(oof.duplicated(["date", "id"]).any())
+            self.assertLess(oof["date"].max(), metrics["test"]["start"])
             output = root / "prediction.csv"
             next_date = (dates[-1] + pd.offsets.BDay(1)).strftime("%Y-%m-%d")
             run("predict.py", "--date", next_date, "--output", str(output))
@@ -64,6 +70,18 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(prediction["id"].tolist(), ["3333", "1111"])
             self.assertEqual(prediction.columns.tolist(), ["id", next_date])
             self.assertTrue(prediction[next_date].isin([0, 1]).all())
+            # Change only held-out test prices: CV scores and selected rounds must
+            # remain identical, even though test and deployment results may change.
+            for stock, rows in originals.items():
+                changed = rows.iloc[30:].copy()
+                changed.loc[changed.index[-3:], "etl:adj_close"] += 10
+                changed.to_csv(live / "market" / f"{stock}.csv", index=False)
+            third = train()
+            changed_metrics = json.loads((artifacts / "metrics.json").read_text())
+            self.assertEqual(third["params"]["n_estimators"], second["params"]["n_estimators"])
+            self.assertEqual(changed_metrics["cross_validation"], metrics["cross_validation"])
+            self.assertEqual(changed_metrics["validation"], metrics["validation"])
+            self.assertNotEqual(changed_metrics["test"]["mse"], metrics["test"]["mse"])
 
 
 if __name__ == "__main__":

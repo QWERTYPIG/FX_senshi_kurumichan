@@ -37,7 +37,7 @@ Manager 提供以下環境變數（都是絕對路徑）：
 
 ## LightGBM baseline
 
-`model/lightgbm_baseline/` 合併 `basic_data/market/` 歷史與 `data/market/` 更新資料，用全部 100 支股票訓練，驗證及預測針對目標 50 支；同日重複資料以 `data/` 為準。提供基本價量／技術特徵、依日期切分驗證、官方報酬計分與 manager 預測介面。
+`model/lightgbm_baseline/` 合併 `basic_data/market/` 歷史與 `data/market/` 更新資料，用全部 100 支股票訓練報酬回歸模型，驗證及預測針對目標 50 支；同日重複資料以 `data/` 為準。提供基本價量／技術特徵、5 折 walk-forward 驗證與獨立最終測試、官方報酬計分及 manager 預測介面。
 
 ```sh
 .venv/bin/python -m pip install -r model/lightgbm_baseline/requirements.txt
