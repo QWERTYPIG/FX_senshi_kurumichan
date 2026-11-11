@@ -86,7 +86,23 @@ def build_data(data_dir, template, update_dir=None):
     return panel.replace([np.inf, -np.inf], np.nan)
 
 
-def fit(frame, features, penalty=0.01):
+def sample_weights(frame, half_life=0):
+    """Return-magnitude weights with optional decay over observed trading dates."""
+    if not np.isfinite(half_life) or half_life < 0:
+        raise ValueError('half_life must be finite and nonnegative')
+    weights = np.abs(frame.target.to_numpy(float))
+    if half_life:
+        if frame.date.isna().any():
+            raise ValueError('Recency weighting requires valid dates')
+        ranks = frame.date.rank(method='dense').to_numpy()
+        weights = weights * np.exp2(-(ranks.max() - ranks) / half_life)
+    scale = weights.mean()
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError('Training requires finite returns and positive total weight')
+    return weights / scale
+
+
+def fit(frame, features, penalty=0.01, half_life=0):
     x = frame[features].to_numpy(float)
     median = np.nanmedian(x, axis=0)
     median = np.nan_to_num(median)
@@ -96,7 +112,7 @@ def fit(frame, features, penalty=0.01):
     x = np.column_stack([np.ones(len(x)), np.clip((x - mean) / std, -10, 10)])
     r = frame.target.to_numpy()
     y = (r > 0).astype(float)
-    weights = np.abs(r) / np.mean(np.abs(r))
+    weights = sample_weights(frame, half_life)
     def objective(beta):
         z = x @ beta
         loss = np.mean(weights * (np.logaddexp(0, z) - y * z)) + penalty / 2 * np.sum(beta[1:] ** 2)
@@ -112,7 +128,7 @@ def fit(frame, features, penalty=0.01):
     magnitude_beta = np.linalg.solve(x.T @ x + reg, x.T @ np.abs(r))
     return dict(features=features, median=median, mean=mean, std=std, beta=result.x,
                 magnitude_beta=magnitude_beta, magnitude_floor=float(np.mean(np.abs(r)) * .01),
-                optimizer_iterations=int(result.nit), penalty=penalty)
+                optimizer_iterations=int(result.nit), penalty=penalty, half_life=half_life)
 
 
 def predict(model, frame):
