@@ -50,6 +50,20 @@ Manager 提供以下環境變數（都是絕對路徑）：
 
 manager 可透過「重新訓練＋預測」使用此模型。每次訓練重新讀檔，預設涵蓋最新有效行情日期，無須調整固定截止日。預測日期必須晚於訓練截止日；Phase 1 歷史回測需另訓練截止日更早的模型。特徵、評估設計、產出檔案與參數詳見 [模型說明](model/lightgbm_baseline/README.md)。
 
+## Logistic regression
+
+`model/logistic_regression/` 提供依報酬絕對值加權的 logistic regression，附上原專案訓練至
+2026-05-29 的模型，可直接透過 manager 預測；`usage.txt` 同時提供重新訓練指令。
+
+```sh
+.venv/bin/python -m pip install -r model/logistic_regression/requirements.txt
+.venv/bin/python model/logistic_regression/predict.py --template /path/to/daily_sample_submission.csv --output model/logistic_regression/prediction.csv
+```
+
+預設重訓保留 Phase 1 的時間切分，只使用 2026-05-31 以前的標籤；需要包含更近期資料時，
+請指定 `--train-end` 與 `--validation-start`。資料目錄必須包含完整歷史，僅有九月以後的更新資料
+無法執行預設重訓。特徵、資料需求、日期限制與參數詳見 [模型說明](model/logistic_regression/README.md)。
+
 ## 同步、排程與計分
 
 - 台北時間每日 **05:10、22:10** 抓取資料；啟動時立即同步，網頁也可手動觸發。

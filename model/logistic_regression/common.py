@@ -5,6 +5,8 @@ import pandas as pd
 MODEL_DIR = Path(__file__).resolve().parent
 ROOT = Path(os.environ.get('MANAGER_ROOT', MODEL_DIR.parents[1]))
 DATA_DIR = Path(os.environ.get('MANAGER_DATA_DIR', ROOT / 'data'))
+BASIC_DATA_DIR = (Path(os.environ['MANAGER_BASIC_DATA_DIR'])
+                  if os.environ.get('MANAGER_BASIC_DATA_DIR') else None)
 TEMPLATE = Path(os.environ.get('MANAGER_TEMPLATE', ROOT / 'manager_data/template.csv'))
 
 
