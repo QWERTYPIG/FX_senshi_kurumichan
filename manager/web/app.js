@@ -15,7 +15,7 @@ async function action(path, body = {}) {
     const result = await api(path, body);
     $('#notice').textContent = path === 'submit-preview'
       ? `檢查通過，未上傳：${result.model} / ${result.tradingDate} / ${result.stocks} 支股票。${result.wouldSubmit ? '檔案可提交。' : '相同預測已有紀錄：' + result.previousStatus}`
-      : path === 'config' ? '設定已儲存' : '工作已排入佇列';
+      : path === 'config' ? '設定已儲存' : result.queued ? '工作已排入佇列' : '這項工作已在佇列或執行中';
     await refresh();
   }
   catch(e) { $('#notice').textContent = e.message; }
@@ -29,7 +29,16 @@ function render(s) {
   $('#stats').innerHTML = stat('Phase 2 場次', p.tradingDate || '未取得場次', p.deadline ? (p.isOpen ? '截止 ' : '目前未開放 · 截止 ') + date(p.deadline) : '開放交易日當天 09:00（台北時間）截止') + stat('剩餘提交額度', p.remaining ?? '待確認', '選用模型：' + (s.selected || '尚未選擇')) + stat('Phase 1 排名', ranks.phase1?.rank ?? '—', '參賽隊伍 ' + (ranks.phase1?.totalTeams ?? '—')) + stat('Phase 2 模擬總排名', ranks.phase2?.mockFinalRank ?? '—', '累積平均名次 ' + (ranks.phase2?.cumulativeAverageRank ?? '—'));
   $('#selected').textContent = s.selected ? '提交模型 / ' + s.selected : '尚未選擇提交模型';
   $('#auto').checked = s.autoSubmit;
-  $('#submit').disabled = !s.selected || !!s.busy;
+  const submissionPending = s.pending.some(key => key === 'submit:' || key === 'scheduled-submit:');
+  $('#submit').disabled = !s.selected || submissionPending;
+  const lastResult = s.events.find(event => event.submission);
+  const receipt = submissions.phase2?.latest;
+  const submissionStatus = submissionPending
+    ? (s.busy === 'submit:' || s.busy === 'scheduled-submit:' ? '正在檢查或提交，請稍候。' : '提交已排隊。')
+    : lastResult ? `${date(lastResult.at)} · ${lastResult.message}`
+      : receipt ? `官方最新收件 ${date(receipt.submittedAt)} · ${receipt.tradingDate} · ${receipt.status}`
+        : '提交結果會顯示在這裡。';
+  if ($('#submit-status').textContent !== submissionStatus) $('#submit-status').textContent = submissionStatus;
   $('#model-count').textContent = s.availableModels.length + ' models';
   $('#models').innerHTML = s.availableModels.length ? s.availableModels.map(name => {
     const runs = s.runs.filter(r => r.model === name), last = runs.at(-1), status = s.models[name] || {};

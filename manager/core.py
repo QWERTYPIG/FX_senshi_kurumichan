@@ -105,6 +105,8 @@ class Manager:
         self.tasks = queue.Queue(maxsize=32)
         self.submit_tasks = queue.Queue(maxsize=8)
         self.submission_lock = threading.Lock()
+        from auth import CompetitionSession
+        self.competition_session = CompetitionSession()
         self.stop = threading.Event()
         self.state_interval = state_interval
         self.command_timeout = command_timeout
@@ -129,9 +131,12 @@ class Manager:
         with self.lock:
             atomic_json(self.path, self.state)
 
-    def event(self, message):
+    def event(self, message, *, submission=False):
         with self.lock:
-            self.state['events'] = ([{'at': now(), 'message': message}] + self.state['events'])[:100]
+            event = {'at': now(), 'message': message}
+            if submission:
+                event['submission'] = True
+            self.state['events'] = ([event] + self.state['events'])[:100]
             self.save()
 
     def discover(self):
@@ -175,7 +180,7 @@ class Manager:
 
     def fetch_state(self):
         from state import fetch_state, summarize
-        raw = fetch_state()
+        raw = fetch_state(self.competition_session)
         compact = summarize(raw)
         with self.lock:
             self.state.update(rawState=raw, competition=compact, lastStateCheck=now())
@@ -261,6 +266,7 @@ class Manager:
             output = usage.parent / 'prediction.csv'
             env = os.environ.copy()
             env.update(MANAGER_ROOT=str(self.root), MANAGER_DATA_DIR=str(self.root / 'data'),
+                       MANAGER_BASIC_DATA_DIR=str(self.root / 'basic_data'),
                        MANAGER_OUTPUT=str(output), MANAGER_TEMPLATE=str(self.template()))
             env['PATH'] = str(Path(sys.executable).parent) + os.pathsep + env.get('PATH', '')
             if train:
@@ -311,14 +317,28 @@ class Manager:
         with self.submission_lock:
             return self._submit_selected(dry_run=dry_run, trading_date=trading_date)
 
+    def queue_submission_prediction(self, model):
+        with self.lock:
+            if 'refresh:' in self.pending or f'train:{model}' in self.pending:
+                return '資料同步或訓練正在處理，稍後再檢查預測'
+            if self.enqueue('predict', model):
+                return '已排入重新預測，完成後由排程重試'
+            return '預測工作已排隊或執行中'
+
     def _submit_selected(self, dry_run=False, trading_date=None):
+        from auth import RequestNotAccepted
         from submit import parse_csv, submit
         # Recheck the active session and quota immediately before a real upload.
         self.fetch_state()
         with self.lock:
             phase = copy.deepcopy(self.state['competition']['phase2'])
         if phase.get('canSubmit') is not True:
-            raise ValueError('目前沒有確認開放且有剩餘額度的 Phase 2 場次')
+            if not phase.get('isOpen'):
+                raise ValueError('官方 Phase 2 場次目前未開放' +
+                                 (f'，截止時間 {phase["deadline"]}' if phase.get('deadline') else ''))
+            if phase.get('remaining') == 0:
+                raise ValueError('目前 Phase 2 場次的提交額度已用完')
+            raise ValueError('官方 API 未提供可確認的 Phase 2 提交額度')
         if trading_date is not None and phase.get('tradingDate') != trading_date:
             raise ValueError('08:30 排程僅提交今天的場次，官方目前場次日期不符')
         with self.lock:
@@ -328,13 +348,21 @@ class Manager:
         if name is None:
             raise ValueError('請先選擇提交模型')
         if not latest or latest['status'] != 'done':
-            raise ValueError('選定模型沒有成功的最新預測')
+            error = latest.get('error') if latest else None
+            raise ValueError(f'{name} 沒有成功的最新預測' + (f'，{error}' if error else ''))
         if latest['dataHash'] != data_hash:
+            if trading_date is not None and not dry_run:
+                raise ValueError('模型預測使用舊資料，' + self.queue_submission_prediction(name))
             raise ValueError('模型預測使用舊資料，請先重新產生預測')
         path = self.store / 'runs' / latest['id'] / 'prediction.csv'
         payload = parse_csv(path)
         if payload['dates'] != [phase['tradingDate']]:
-            raise ValueError('預測日期必須等於目前 Phase 2 場次日期（僅一欄）')
+            recovery = '請先產生該場次的單日預測'
+            if trading_date is not None and not dry_run:
+                recovery = self.queue_submission_prediction(name)
+            raise ValueError(f'官方場次為 {phase["tradingDate"]}，'
+                             f'{name} 的預測從 {payload["dates"][0]} 起有 {len(payload["dates"])} 個日期欄，'
+                             f'{recovery}')
         key = phase['tradingDate'] + ':' + hashlib.sha256(path.read_bytes()).hexdigest()
         previous = next((s for s in self.state['submissions'] if s['key'] == key), None)
         if dry_run:
@@ -344,7 +372,10 @@ class Manager:
                     'previousStatus': previous['status'] if previous else None,
                     'submissionTime': '08:30', 'timezone': 'Asia/Taipei'}
         if previous:
-            self.event('相同日期與預測已提交，略過重複提交')
+            if previous['status'] == 'sent':
+                self.event('相同日期與預測已有成功提交紀錄', submission=True)
+            else:
+                self.event('相同預測的提交結果未確認，請核對官方 Submission Status', submission=True)
             return previous['status']
         # Save intent first: ambiguous network failure must not trigger automatic duplicates.
         entry = {'key': key, 'at': now(), 'model': name, 'run': latest['id'], 'status': 'sending'}
@@ -354,10 +385,17 @@ class Manager:
                 self.state['lastScheduledSubmissionDate'] = trading_date
             self.save()
         try:
-            submit(path, 2, dry_run=False)
+            submit(path, 2, dry_run=False, client=self.competition_session)
             with self.lock:
                 entry['status'] = 'sent'
-            self.event(f'{name} 已提交 {phase["tradingDate"]}')
+            self.event(f'{name} 已提交 {phase["tradingDate"]}', submission=True)
+        except RequestNotAccepted:
+            # The server did not accept this upload. Release its reservation.
+            with self.lock:
+                self.state['submissions'].remove(entry)
+                if trading_date is not None:
+                    self.state.pop('lastScheduledSubmissionDate', None)
+            raise
         except Exception as exc:
             with self.lock:
                 entry.update(status='uncertain', error=str(exc))
@@ -435,7 +473,8 @@ class Manager:
                 elif action == 'submit':
                     self.submit_selected()
             except Exception as exc:
-                self.event(f'{key} 失敗：{exc}')
+                label = {'submit': '手動提交', 'scheduled-submit': '08:30 自動提交'}.get(action, key)
+                self.event(f'{label}失敗：{exc}', submission=is_submission)
             finally:
                 with self.lock:
                     if is_submission:

@@ -8,7 +8,7 @@ import pandas as pd
 MODEL_DIR = Path(__file__).resolve().parent
 ROOT = MODEL_DIR.parents[1]
 DATA_DIR = Path(os.environ.get("MANAGER_DATA_DIR", ROOT / "data"))
-HISTORY_DIR = ROOT / "basic_data"
+HISTORY_DIR = Path(os.environ.get("MANAGER_BASIC_DATA_DIR", ROOT / "basic_data"))
 # Standalone execution should reuse the manager's latest generated template.
 # The canonical all_down file is a stock-list / Phase 1 reference, not today's template.
 TEMPLATE = Path(os.environ.get("MANAGER_TEMPLATE", ROOT / "manager_data/template.csv"))
