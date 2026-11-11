@@ -31,26 +31,23 @@ def local_time(timestamp):
     return dt.astimezone(TAIPEI).isoformat(timespec="seconds")
 
 
-def fetch_state():
-    from auth import login  # Uses the existing login + Session cookies
+def fetch_state(client=None):
+    from auth import CompetitionSession
 
-    # Older auth.py versions print a success message; keep stdout valid JSON.
-    with redirect_stdout(sys.stderr):
-        session = login()
-
-    with session:
-        response = session.get(
-            f"{BASE_URL}/api/state",
-            headers={"Referer": f"{BASE_URL}/"},
-            timeout=30,
-        )
-        response.raise_for_status()
-        if "application/json" not in response.headers.get("Content-Type", ""):
-            raise RuntimeError("/api/state did not return JSON (session expired?)")
-        state = response.json()
-        if not isinstance(state, dict) or "team" not in state:
-            raise RuntimeError("Unexpected /api/state response")
-        return state
+    client = client if client is not None else CompetitionSession()
+    response = client.request(
+        "GET",
+        f"{BASE_URL}/api/state",
+        headers={"Referer": f"{BASE_URL}/"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    if "application/json" not in response.headers.get("Content-Type", ""):
+        raise RuntimeError("/api/state did not return JSON (session expired?)")
+    state = response.json()
+    if not isinstance(state, dict) or "team" not in state:
+        raise RuntimeError("Unexpected /api/state response")
+    return state
 
 
 def submission_summary(state, phase):
@@ -205,7 +202,11 @@ def main():
     parser.add_argument("--stdout-only", action="store_true", help="Print JSON but do not save a file")
     args = parser.parse_args()
 
-    state = json.loads(args.input.read_text(encoding="utf-8")) if args.input else fetch_state()
+    if args.input:
+        state = json.loads(args.input.read_text(encoding="utf-8"))
+    else:
+        with redirect_stdout(sys.stderr):
+            state = fetch_state()
     result = summarize(state)
     output = json.dumps(result, indent=2, ensure_ascii=False) + "\n"
     if not args.stdout_only:

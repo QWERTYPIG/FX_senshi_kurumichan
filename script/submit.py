@@ -3,7 +3,7 @@ import csv
 import json
 from pathlib import Path
 
-from auth import BASE_URL, login
+from auth import BASE_URL, CompetitionSession
 
 
 def parse_csv(path: Path):
@@ -61,7 +61,7 @@ def parse_csv(path: Path):
         "predictions": predictions,
     }
 
-def submit(path: Path, phase: int, dry_run=True):
+def submit(path: Path, phase: int, dry_run=True, *, client=None):
     if phase not in (1, 2):
         raise ValueError("Phase must be 1 or 2")
 
@@ -116,31 +116,26 @@ def submit(path: Path, phase: int, dry_run=True):
         return
 
     # Submit exactly once
-    with login() as session:
-        response = session.post(
-            f"{BASE_URL}/api/submissions",
-            json=payload,
-            headers={
-                "Referer": f"{BASE_URL}/",
-            },
-            timeout=30,
+    client = client if client is not None else CompetitionSession()
+    response = client.request(
+        "POST",
+        f"{BASE_URL}/api/submissions",
+        json=payload,
+        headers={"Referer": f"{BASE_URL}/"},
+        timeout=30,
+    )
+
+    print("Status:", response.status_code)
+
+    try:
+        print(
+            "Response:",
+            json.dumps(response.json(), indent=2, ensure_ascii=False),
         )
+    except ValueError:
+        print("Response:", response.text)
 
-        print("Status:", response.status_code)
-
-        try:
-            print(
-                "Response:",
-                json.dumps(
-                    response.json(),
-                    indent=2,
-                    ensure_ascii=False,
-                ),
-            )
-        except ValueError:
-            print("Response:", response.text)
-
-        response.raise_for_status()
+    response.raise_for_status()
 
 
 if __name__ == "__main__":

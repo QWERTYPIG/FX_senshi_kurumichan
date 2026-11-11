@@ -1,10 +1,15 @@
 """Offline tests: injected Taipei times, temporary files, no real upload or login."""
 from datetime import datetime
+from contextlib import redirect_stdout
+import io
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import requests
 
 import test_manager
+from auth import RequestNotAccepted
 from manager.core import Manager
 
 
@@ -103,6 +108,69 @@ class ScheduledSubmitTests(unittest.TestCase):
         with patch.object(self.m, 'fetch_state'), patch('submit.submit') as upload:
             self.drain_scheduled(at('2026-11-06T08:31:00+08:00'))
             upload.assert_called_once()
+
+    def test_stale_prediction_is_regenerated_then_submitted(self):
+        self.ready()
+        self.m.state['dataHash'] = 'new-data'
+        self.m.state['competition']['phase2']['isOpen'] = True
+        with patch.object(self.m, 'fetch_state'), patch('submit.submit') as upload:
+            with self.assertRaisesRegex(ValueError, '已排入重新預測'):
+                self.m.scheduled_submit(at())
+            upload.assert_not_called()
+            self.assertEqual(self.m.tasks.get_nowait(), ('predict:good', 'predict', 'good'))
+            self.m.run_model('good')
+            self.m.scheduled_submit(at('2026-11-06T08:31:00+08:00'))
+            upload.assert_called_once()
+        self.assertEqual(self.m.state['runs'][-1]['dataHash'], 'new-data')
+        self.assertFalse(self.m.state['runs'][-1]['trained'])
+
+    def ready_with_fifty_stocks(self):
+        (self.root / 'model/all_down/all_down.csv').write_text(
+            'id,2026-11-06\n' + ''.join(f'{stock},0\n' for stock in range(1000, 1050)),
+        )
+        self.ready()
+
+    def test_state_check_and_upload_share_one_login(self):
+        self.ready_with_fifty_stocks()
+        session = Mock()
+        session.request.side_effect = [
+            Mock(status_code=200, headers={'Content-Type': 'application/json'},
+                 json=Mock(return_value={'team': {'id': 'test'}})),
+            Mock(status_code=201, json=Mock(return_value={'ok': True})),
+        ]
+        with patch('auth.login', return_value=session) as login, \
+                patch('state.summarize', return_value=self.m.state['competition']), \
+                redirect_stdout(io.StringIO()):
+            self.m.scheduled_submit(at())
+        login.assert_called_once()
+        self.assertEqual([call.args[0] for call in session.request.call_args_list], ['GET', 'POST'])
+        self.assertEqual(self.m.state['submissions'][0]['status'], 'sent')
+
+    def test_login_429_during_upload_releases_reservation_and_respects_retry_after(self):
+        self.ready_with_fifty_stocks()
+        response = requests.Response()
+        response.status_code = 429
+        response.headers['Retry-After'] = '120'
+        error = requests.HTTPError('login rate limit', response=response)
+        session = Mock()
+        session.request.return_value = Mock(status_code=201, json=Mock(return_value={'ok': True}))
+        with patch.object(self.m, 'fetch_state'), \
+                patch('auth.login', side_effect=[error, session]) as login, \
+                patch('auth.time.monotonic', return_value=100) as clock, \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(RequestNotAccepted, '429'):
+                self.m.scheduled_submit(at())
+            self.assertEqual(self.m.state['submissions'], [])
+            self.assertIsNone(self.m.state.get('lastScheduledSubmissionDate'))
+            clock.return_value = 160
+            with self.assertRaisesRegex(RequestNotAccepted, 'Retry-After'):
+                self.m.scheduled_submit(at('2026-11-06T08:31:00+08:00'))
+            login.assert_called_once()
+            session.request.assert_not_called()
+            clock.return_value = 220
+            self.m.scheduled_submit(at('2026-11-06T08:32:00+08:00'))
+            session.request.assert_called_once()
+        self.assertEqual(self.m.state['submissions'][0]['status'], 'sent')
 
     def test_closed_or_wrong_day_session_never_uploaded(self):
         self.ready()
