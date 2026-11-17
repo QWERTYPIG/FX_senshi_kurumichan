@@ -3,7 +3,11 @@ import csv
 import json
 from pathlib import Path
 
-from auth import BASE_URL, CompetitionSession
+from auth import BASE_URL, CompetitionSession, RequestNotAccepted
+
+
+class SubmissionRejected(RequestNotAccepted):
+    """The submission endpoint explicitly rejected the payload."""
 
 
 def parse_csv(path: Path):
@@ -61,7 +65,7 @@ def parse_csv(path: Path):
         "predictions": predictions,
     }
 
-def submit(path: Path, phase: int, dry_run=True, *, client=None):
+def submit(path: Path, phase: int, dry_run=True, *, client=None, file_name=None, note=""):
     if phase not in (1, 2):
         raise ValueError("Phase must be 1 or 2")
 
@@ -92,9 +96,9 @@ def submit(path: Path, phase: int, dry_run=True, *, client=None):
 
     payload = {
         "phase": phase,
-        "fileName": path.name,
+        "fileName": file_name if file_name is not None else path.name,
         "payload": data,
-        "note": "",
+        "note": note,
     }
 
     # Preview
@@ -127,15 +131,22 @@ def submit(path: Path, phase: int, dry_run=True, *, client=None):
 
     print("Status:", response.status_code)
 
+    result = None
     try:
+        result = response.json()
         print(
             "Response:",
-            json.dumps(response.json(), indent=2, ensure_ascii=False),
+            json.dumps(result, indent=2, ensure_ascii=False),
         )
     except ValueError:
         print("Response:", response.text)
 
+    if 400 <= response.status_code < 500:
+        raise SubmissionRejected(f'官方拒絕提交（HTTP {response.status_code}）：{response.text[:500]}')
     response.raise_for_status()
+    if isinstance(result, dict) and result.get("error"):
+        raise SubmissionRejected(f'官方拒絕提交：{result["error"]}')
+    return result
 
 
 if __name__ == "__main__":

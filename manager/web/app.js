@@ -29,6 +29,7 @@ function render(s) {
   $('#stats').innerHTML = stat('Phase 2 場次', p.tradingDate || '未取得場次', p.deadline ? (p.isOpen ? '截止 ' : '目前未開放 · 截止 ') + date(p.deadline) : '開放交易日當天 09:00（台北時間）截止') + stat('剩餘提交額度', p.remaining ?? '待確認', '選用模型：' + (s.selected || '尚未選擇')) + stat('Phase 1 排名', ranks.phase1?.rank ?? '—', '參賽隊伍 ' + (ranks.phase1?.totalTeams ?? '—')) + stat('Phase 2 模擬總排名', ranks.phase2?.mockFinalRank ?? '—', '累積平均名次 ' + (ranks.phase2?.cumulativeAverageRank ?? '—'));
   $('#selected').textContent = s.selected ? '提交模型 / ' + s.selected : '尚未選擇提交模型';
   $('#auto').checked = s.autoSubmit;
+  $('#batch-order').textContent = '提交順序：' + (s.submissionOrder || []).join(' → ');
   const submissionPending = s.pending.some(key => key === 'submit:' || key === 'scheduled-submit:');
   $('#submit').disabled = !s.selected || submissionPending;
   const lastResult = s.events.find(event => event.submission);
@@ -46,10 +47,23 @@ function render(s) {
     const days = new Map();
     for (const r of runs) for (const score of r.scores) if (score.prospective) days.set(score.date, score);
     const live = [...days.values()];
-    return `<article class="model ${s.selected === name ? 'selected' : ''}"><h3>${esc(name)} ${s.selected === name ? '✓' : ''}</h3><small>${esc(status.status || '尚未執行')}</small>${status.error ? `<p class="error">${esc(status.error)}</p>` : ''}<div class="metrics"><div class="metric"><small>即時日均分數 · ${live.length} 日</small><strong>${fmt(mean(live))}</strong></div><div class="metric"><small>最新預測歷史回算</small><strong>${fmt(mean((last?.scores || []).filter(x => !x.prospective)))}</strong></div></div><div class="actions"><button data-action="train" data-model="${esc(name)}" ${s.busy ? 'disabled' : ''}>重新訓練＋預測</button><button class="secondary" data-action="predict" data-model="${esc(name)}" ${s.busy ? 'disabled' : ''}>產生預測</button><button class="secondary" data-select="${esc(name)}">${s.selected === name ? '已選為提交模型' : '選為提交模型'}</button></div></article>`;
+    const officialDays = new Map();
+    for (const entry of s.submissions) {
+      if (entry.model === name && entry.officialScore != null) officialDays.set(entry.tradingDate, {score:entry.officialScore});
+    }
+    const officialScores = [...officialDays.values()];
+    return `<article class="model ${s.selected === name ? 'selected' : ''}"><h3>${esc(name)} ${s.selected === name ? '✓' : ''}</h3><small>${esc(status.status || '尚未執行')}</small>${status.error ? `<p class="error">${esc(status.error)}</p>` : ''}<div class="metrics"><div class="metric"><small>官方日均分數 · ${officialScores.length} 日</small><strong>${fmt(mean(officialScores))}</strong></div><div class="metric"><small>即時日均分數 · ${live.length} 日</small><strong>${fmt(mean(live))}</strong></div><div class="metric"><small>最新預測歷史回算</small><strong>${fmt(mean((last?.scores || []).filter(x => !x.prospective)))}</strong></div></div><div class="actions"><button data-action="train" data-model="${esc(name)}" ${s.busy ? 'disabled' : ''}>重新訓練＋預測</button><button class="secondary" data-action="predict" data-model="${esc(name)}" ${s.busy ? 'disabled' : ''}>產生預測</button><button class="secondary" data-select="${esc(name)}">${s.selected === name ? '已選為提交模型' : '選為提交模型'}</button></div></article>`;
   }).join('') : '<div class="empty">尚未找到模型。請在 repo 的 <code>model/&lt;model_name&gt;/usage.txt</code> 填入兩行指令：第一行預測，第二行訓練。</div>';
   $('#runs').innerHTML = [...s.runs].reverse().slice(0, 100).map(r => `<tr><td>${esc(r.model)}<small>${esc(date(r.createdAt))}</small></td><td>${esc(r.status)}${r.error ? `<small class="error">${esc(r.error)}</small>` : ''}</td><td>${fmt(mean(r.scores.filter(x => x.prospective)))}</td><td>${fmt(mean(r.scores.filter(x => !x.prospective)))}</td><td>${r.scores.length} / ${r.dates?.length ?? '—'}</td><td><a href="/api/runs/${encodeURIComponent(r.id)}/log" target="_blank" rel="noopener">Log</a>${r.status === 'done' ? `<a href="/api/runs/${encodeURIComponent(r.id)}/csv" target="_blank" rel="noopener">CSV</a>` : ''}</td></tr>`).join('') || '<tr><td colspan="6">尚無預測紀錄</td></tr>';
+  $('#official-submissions').innerHTML = [...s.submissions].reverse().map(entry => {
+    const status = entry.officialScore != null ? '已計分' : entry.status === 'sent' ? 'Pending' : entry.status;
+    return `<tr><td>${esc(entry.model)}<small>${esc(entry.tradingDate || entry.key.split(':')[0])}</small></td><td>${esc(status)}${entry.error ? `<small class="error">${esc(entry.error)}</small>` : ''}</td><td>${fmt(entry.officialScore)}</td><td>${esc(date(entry.officialSubmittedAt))}</td><td>${esc(entry.officialId)}</td></tr>`;
+  }).join('') || '<tr><td colspan="5">尚無 manager 提交紀錄</td></tr>';
   const extra = [];
+  for (const [day, batch] of Object.entries(s.submissionBatches || {}).reverse().slice(0, 3)) {
+    extra.push({at:batch.completedAt || batch.createdAt, message:`批次 ${day}：${batch.status}，已完成 ${batch.completed.join(' → ')}${batch.error ? ' / ' + batch.error : ''}`});
+    for (const [model, error] of Object.entries(batch.skipped)) extra.push({at:batch.createdAt,message:`批次 ${day} 略過 ${model}：${error}`});
+  }
   if (submissions.phase2?.latest) extra.push({at:submissions.phase2.latest.submittedAt,message:'官方最新提交：' + submissions.phase2.latest.file + ' · ' + (submissions.phase2.latest.score == null ? 'Pending' : fmt(submissions.phase2.latest.score))});
   for (const item of [...s.submissions].reverse().slice(0, 5)) extra.push({at:item.at,message:`提交 ${item.model}：${item.status}${item.error ? ' / ' + item.error : ''}`});
   $('#events').innerHTML = [...extra, ...s.events].slice(0, 35).map(e => `<li><time>${esc(date(e.at))}</time><span>${esc(e.message)}</span></li>`).join('') || '<li>啟動後會自動同步比賽資訊與資料。</li>';
