@@ -136,6 +136,8 @@ class ScheduledSubmitTests(unittest.TestCase):
         session.request.side_effect = [
             Mock(status_code=200, headers={'Content-Type': 'application/json'},
                  json=Mock(return_value={'team': {'id': 'test'}})),
+            Mock(status_code=200, headers={'Content-Type': 'application/json'},
+                 json=Mock(return_value={'team': {'id': 'test'}})),
             Mock(status_code=201, json=Mock(return_value={'ok': True})),
         ]
         with patch('auth.login', return_value=session) as login, \
@@ -143,7 +145,7 @@ class ScheduledSubmitTests(unittest.TestCase):
                 redirect_stdout(io.StringIO()):
             self.m.scheduled_submit(at())
         login.assert_called_once()
-        self.assertEqual([call.args[0] for call in session.request.call_args_list], ['GET', 'POST'])
+        self.assertEqual([call.args[0] for call in session.request.call_args_list], ['GET', 'GET', 'POST'])
         self.assertEqual(self.m.state['submissions'][0]['status'], 'sent')
 
     def test_login_429_during_upload_releases_reservation_and_respects_retry_after(self):
@@ -191,7 +193,11 @@ class ScheduledSubmitTests(unittest.TestCase):
                 self.m.scheduled_submit(at())
         self.assertEqual(self.m.state['submissions'][0]['status'], 'uncertain')
         restarted = Manager(self.root)
-        self.assertFalse(restarted.queue_scheduled_submission(at('2026-11-06T08:40:00+08:00')))
+        self.assertTrue(restarted.queue_scheduled_submission(at('2026-11-06T08:40:00+08:00')))
+        with patch.object(restarted, 'fetch_state'), patch('submit.submit') as upload:
+            with self.assertRaisesRegex(RuntimeError, '結果未確認'):
+                restarted.scheduled_submit(at('2026-11-06T08:40:00+08:00'))
+            upload.assert_not_called()
 
     def test_preview_checks_real_pipeline_without_upload_or_consuming_slot(self):
         self.ready()

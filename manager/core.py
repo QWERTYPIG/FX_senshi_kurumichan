@@ -23,6 +23,10 @@ TAIPEI = ZoneInfo('Asia/Taipei')
 sys.path.insert(0, str(ROOT / 'script'))
 
 
+class PredictionNotReady(ValueError):
+    """The batch must wait for a queued prediction."""
+
+
 def now():
     return datetime.now(TAIPEI).isoformat(timespec='seconds')
 
@@ -116,6 +120,7 @@ class Manager:
             'models': {}, 'events': [], 'competition': None, 'rawState': {},
             'submissions': [], 'lastCheck': None, 'lastStateCheck': None,
         }
+        self.state.setdefault('submissionBatches', {})
         # Interrupted runs must be retried instead of remaining permanently 'running'.
         for record in self.state['runs']:
             if record['status'] == 'running':
@@ -152,6 +157,14 @@ class Manager:
             result['pending'] = sorted(self.pending)
             result['schedule'] = ['05:10', '22:10']
             result['submissionTime'] = '08:30'
+            batch = self.state['submissionBatches'].get(datetime.now(TAIPEI).date().isoformat())
+            if batch is not None:
+                result['submissionOrder'] = batch['order']
+            else:
+                selected = self.state['selected']
+                result['submissionOrder'] = [name for name in self.discover() if name != selected]
+                if selected is not None:
+                    result['submissionOrder'].append(selected)
             return result
 
     def enqueue(self, action, model=None):
@@ -184,8 +197,28 @@ class Manager:
         compact = summarize(raw)
         with self.lock:
             self.state.update(rawState=raw, competition=compact, lastStateCheck=now())
+            self.sync_official_scores(raw)
             self.save()
         self.event('比賽資訊已更新')
+
+    def sync_official_scores(self, raw):
+        """Match unique filenames across active and archived official submissions."""
+        records = [r for field in ('mySubmissions', 'submissionHistory')
+                   for r in (raw.get(field) or []) if r.get('phase') == 2]
+        with self.lock:
+            for entry in self.state['submissions']:
+                filename = entry.get('fileName')
+                if not filename:
+                    continue
+                matches = [r for r in records if r.get('fileName') == filename
+                           and r.get('tradingDate') == entry.get('tradingDate')]
+                if len(matches) != 1:
+                    continue
+                official = matches[0]
+                entry.update(status='sent', officialId=official.get('id'),
+                             officialSubmittedAt=official.get('submittedAt'),
+                             officialScore=official.get('score'), scoreCheckedAt=now())
+                entry.pop('error', None)
 
     def refresh(self):
         from downloads import download_data
@@ -325,13 +358,19 @@ class Manager:
                 return '已排入重新預測，完成後由排程重試'
             return '預測工作已排隊或執行中'
 
-    def _submit_selected(self, dry_run=False, trading_date=None):
+    def _submit_selected(self, dry_run=False, trading_date=None, model=None, batch_date=None,
+                         repair_prediction=False, reserve_final=False):
         from auth import RequestNotAccepted
         from submit import parse_csv, submit
         # Recheck the active session and quota immediately before a real upload.
         self.fetch_state()
         with self.lock:
             phase = copy.deepcopy(self.state['competition']['phase2'])
+            existing = next((s for s in reversed(self.state['submissions'])
+                             if batch_date is not None and s.get('batchDate') == batch_date
+                             and s['model'] == model), None)
+        if existing is not None and not dry_run:
+            return existing['status']
         if phase.get('canSubmit') is not True:
             if not phase.get('isOpen'):
                 raise ValueError('官方 Phase 2 場次目前未開放' +
@@ -339,32 +378,47 @@ class Manager:
             if phase.get('remaining') == 0:
                 raise ValueError('目前 Phase 2 場次的提交額度已用完')
             raise ValueError('官方 API 未提供可確認的 Phase 2 提交額度')
+        if reserve_final and phase.get('remaining') == 1:
+            raise ValueError('剩餘額度僅一次，保留給最後的選定模型')
         if trading_date is not None and phase.get('tradingDate') != trading_date:
             raise ValueError('08:30 排程僅提交今天的場次，官方目前場次日期不符')
         with self.lock:
-            name = self.state['selected']
+            name = model if model is not None else self.state['selected']
             latest = copy.deepcopy(next((r for r in reversed(self.state['runs']) if r['model'] == name), None))
             data_hash = self.state['dataHash']
         if name is None:
             raise ValueError('請先選擇提交模型')
         if not latest or latest['status'] != 'done':
             error = latest.get('error') if latest else None
-            raise ValueError(f'{name} 沒有成功的最新預測' + (f'，{error}' if error else ''))
+            recovery = ''
+            if repair_prediction:
+                recovery = '，' + self.queue_submission_prediction(name)
+            if batch_date is not None and (not latest or latest['status'] == 'running'):
+                raise PredictionNotReady(f'{name} 尚未完成預測，' + self.queue_submission_prediction(name))
+            raise ValueError(f'{name} 沒有成功的最新預測' + (f'，{error}' if error else '') + recovery)
         if latest['dataHash'] != data_hash:
-            if trading_date is not None and not dry_run:
-                raise ValueError('模型預測使用舊資料，' + self.queue_submission_prediction(name))
+            if trading_date is not None and (not dry_run or repair_prediction):
+                raise PredictionNotReady('模型預測使用舊資料，' + self.queue_submission_prediction(name))
             raise ValueError('模型預測使用舊資料，請先重新產生預測')
         path = self.store / 'runs' / latest['id'] / 'prediction.csv'
         payload = parse_csv(path)
         if payload['dates'] != [phase['tradingDate']]:
             recovery = '請先產生該場次的單日預測'
-            if trading_date is not None and not dry_run:
+            if trading_date is not None and (not dry_run or repair_prediction):
                 recovery = self.queue_submission_prediction(name)
+                raise PredictionNotReady(f'{name} 預測日期不符，{recovery}')
             raise ValueError(f'官方場次為 {phase["tradingDate"]}，'
                              f'{name} 的預測從 {payload["dates"][0]} 起有 {len(payload["dates"])} 個日期欄，'
                              f'{recovery}')
-        key = phase['tradingDate'] + ':' + hashlib.sha256(path.read_bytes()).hexdigest()
-        previous = next((s for s in self.state['submissions'] if s['key'] == key), None)
+        content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        key = phase['tradingDate'] + ':' + name + ':' + content_hash
+        if batch_date is not None:
+            previous = next((s for s in reversed(self.state['submissions'])
+                             if s.get('batchDate') == batch_date and s['model'] == name), None)
+        else:
+            legacy_key = phase['tradingDate'] + ':' + content_hash
+            previous = next((s for s in reversed(self.state['submissions'])
+                             if s['model'] == name and s['key'] in (key, legacy_key)), None)
         if dry_run:
             return {'status': 'dry-run', 'wouldSubmit': previous is None, 'model': name,
                     'tradingDate': phase['tradingDate'], 'file': str(path),
@@ -378,23 +432,25 @@ class Manager:
                 self.event('相同預測的提交結果未確認，請核對官方 Submission Status', submission=True)
             return previous['status']
         # Save intent first: ambiguous network failure must not trigger automatic duplicates.
-        entry = {'key': key, 'at': now(), 'model': name, 'run': latest['id'], 'status': 'sending'}
+        token = uuid.uuid4().hex
+        entry = {'key': key, 'at': now(), 'model': name, 'run': latest['id'], 'status': 'sending',
+                 'tradingDate': phase['tradingDate'], 'batchDate': batch_date,
+                 'fileName': f'manager-{token}.csv', 'officialScore': None}
         with self.lock:
             self.state['submissions'].append(entry)
-            if trading_date is not None:
-                self.state['lastScheduledSubmissionDate'] = trading_date
             self.save()
         try:
-            submit(path, 2, dry_run=False, client=self.competition_session)
+            receipt = submit(path, 2, dry_run=False, client=self.competition_session,
+                             file_name=entry['fileName'], note=f'model={name}; run={latest["id"]}')
             with self.lock:
                 entry['status'] = 'sent'
+                if isinstance(receipt, dict):
+                    entry['receipt'] = receipt
             self.event(f'{name} 已提交 {phase["tradingDate"]}', submission=True)
         except RequestNotAccepted:
             # The server did not accept this upload. Release its reservation.
             with self.lock:
                 self.state['submissions'].remove(entry)
-                if trading_date is not None:
-                    self.state.pop('lastScheduledSubmissionDate', None)
             raise
         except Exception as exc:
             with self.lock:
@@ -427,26 +483,68 @@ class Manager:
         return False
 
     def scheduled_submit(self, current=None):
+        from submit import SubmissionRejected
         current = (current or datetime.now(TAIPEI)).astimezone(TAIPEI)
-        # Recheck on execution: disable/cancel, queue delay, or deadline may have intervened.
         if not self.scheduled_submission_due(current):
             return
         date = current.date().isoformat()
-        try:
-            status = self.submit_selected(trading_date=date)
-        except Exception:
-            # An ambiguous upload must not be retried with a different CSV after restart.
+        # Hold the same lock as manual uploads for the whole batch.
+        with self.submission_lock:
             with self.lock:
-                uncertain = any(s['key'].startswith(date + ':') and s['status'] in {'sending', 'uncertain'}
-                                for s in self.state['submissions'])
-                if uncertain:
+                batch = self.state['submissionBatches'].get(date)
+                if batch is None:
+                    selected = self.state['selected']
+                    order = [name for name in self.discover() if name != selected] + [selected]
+                    batch = {'selected': selected, 'order': order, 'completed': [],
+                             'skipped': {}, 'status': 'pending', 'createdAt': now()}
+                    self.state['submissionBatches'][date] = batch
+                    self.save()
+            selected = batch['selected']
+            try:
+                # Prepare the final model before allowing other models to replace the official current entry.
+                with self.lock:
+                    final_sent = any(s.get('batchDate') == date and s['model'] == selected
+                                     and s['status'] == 'sent' for s in self.state['submissions'])
+                if not final_sent:
+                    self._submit_selected(dry_run=True, trading_date=date, model=selected,
+                                          batch_date=date, repair_prediction=True)
+                for name in batch['order']:
+                    if name in batch['completed'] or name in batch['skipped']:
+                        continue
+                    with self.lock:
+                        enabled = self.state['autoSubmit']
+                    if not enabled:
+                        raise ValueError('自動提交已關閉，批次暫停')
+                    try:
+                        status = self._submit_selected(trading_date=date, model=name, batch_date=date,
+                                                       reserve_final=name != selected,
+                                                       repair_prediction=name == selected)
+                    except PredictionNotReady:
+                        raise
+                    except (ValueError, SubmissionRejected) as exc:
+                        if name == selected:
+                            raise
+                        with self.lock:
+                            batch['skipped'][name] = str(exc)
+                            self.save()
+                        self.event(f'批次略過 {name}：{exc}', submission=True)
+                        continue
+                    if status != 'sent':
+                        raise RuntimeError(f'{name} 的提交結果未確認，等待官方紀錄後繼續批次')
+                    with self.lock:
+                        batch['completed'].append(name)
+                        self.save()
+                with self.lock:
+                    batch.update(status='complete', completedAt=now())
+                    batch.pop('error', None)
                     self.state['lastScheduledSubmissionDate'] = date
                     self.save()
-            raise
-        with self.lock:
-            self.state['lastScheduledSubmissionDate'] = date
-            self.save()
-        self.event(f'08:30 排程完成：{date}（{status}）')
+                self.event(f'08:30 批次完成：{date}，{selected} 最後提交', submission=True)
+            except Exception as exc:
+                with self.lock:
+                    batch.update(status='pending', error=str(exc))
+                    self.save()
+                raise
 
     def worker(self, tasks=None):
         tasks = self.tasks if tasks is None else tasks
