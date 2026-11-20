@@ -1,0 +1,58 @@
+{
+  "window_length": 60,
+  "hidden_size": 64,
+  "gru_layers": 1,
+  "head_hidden_size": 16,
+  "learning_rate": 0.001,
+  "epochs": 2,
+  "seed": 42,
+  "attention": true,
+  "embedding": true,
+  "embedding_size": 4,
+  "input_noise_std": 0.1,
+  "search": {
+    "window_length": [20, 60, 120],
+    "gru_layers": [1, 2],
+    "hidden_size": [32, 64],
+    "seeds": [42, 43, 44]
+  },
+  "deployment_seeds": [42, 43, 44, 45, 46],
+  "evaluation": {
+    "folds": [
+      {"start": "2024-07-01", "end": "2024-09-30"},
+      {"start": "2024-10-01", "end": "2024-12-31"},
+      {"start": "2025-01-01", "end": "2025-03-31"},
+      {"start": "2025-04-01", "end": "2025-06-30"},
+      {"start": "2025-07-01", "end": "2025-09-30"},
+      {"start": "2025-10-01", "end": "2025-12-31"},
+      {"start": "2026-01-01", "end": "2026-03-31"},
+      {"start": "2026-04-01", "end": "2026-05-29"}
+    ],
+    "early_stopping_days": 60,
+    "patience": 2,
+    "max_epochs": 5,
+    "final_test_start": "2026-06-01"
+  },
+  "epoch_selection": {
+    "trial": "grid-6",
+    "refit_epochs": 2,
+    "folds": [
+      {"fold": 1, "start": "2024-07-01", "end": "2024-09-30", "median_best_epoch": 5,
+       "seed_best_epochs": [{"seed": 42, "best_epoch": 5}, {"seed": 43, "best_epoch": 5}, {"seed": 44, "best_epoch": 2}]},
+      {"fold": 2, "start": "2024-10-01", "end": "2024-12-31", "median_best_epoch": 5,
+       "seed_best_epochs": [{"seed": 42, "best_epoch": 5}, {"seed": 43, "best_epoch": 5}, {"seed": 44, "best_epoch": 4}]},
+      {"fold": 3, "start": "2025-01-01", "end": "2025-03-31", "median_best_epoch": 3,
+       "seed_best_epochs": [{"seed": 42, "best_epoch": 5}, {"seed": 43, "best_epoch": 3}, {"seed": 44, "best_epoch": 3}]},
+      {"fold": 4, "start": "2025-04-01", "end": "2025-06-30", "median_best_epoch": 2,
+       "seed_best_epochs": [{"seed": 42, "best_epoch": 1}, {"seed": 43, "best_epoch": 2}, {"seed": 44, "best_epoch": 2}]},
+      {"fold": 5, "start": "2025-07-01", "end": "2025-09-30", "median_best_epoch": 1,
+       "seed_best_epochs": [{"seed": 42, "best_epoch": 1}, {"seed": 43, "best_epoch": 1}, {"seed": 44, "best_epoch": 1}]},
+      {"fold": 6, "start": "2025-10-01", "end": "2025-12-31", "median_best_epoch": 2,
+       "seed_best_epochs": [{"seed": 42, "best_epoch": 3}, {"seed": 43, "best_epoch": 2}, {"seed": 44, "best_epoch": 1}]},
+      {"fold": 7, "start": "2026-01-01", "end": "2026-03-31", "median_best_epoch": 2,
+       "seed_best_epochs": [{"seed": 42, "best_epoch": 5}, {"seed": 43, "best_epoch": 1}, {"seed": 44, "best_epoch": 2}]},
+      {"fold": 8, "start": "2026-04-01", "end": "2026-05-29", "median_best_epoch": 2,
+       "seed_best_epochs": [{"seed": 42, "best_epoch": 5}, {"seed": 43, "best_epoch": 1}, {"seed": 44, "best_epoch": 2}]}
+    ]
+  }
+}
