@@ -48,8 +48,12 @@ class Config:
             raise ValueError("learning_rate must be positive and finite")
 
     @classmethod
+    def from_settings(cls, settings):
+        return cls(**{key: value for key, value in settings.items() if key != "evaluation"})
+
+    @classmethod
     def read(cls, path: Path):
-        return cls(**json.loads(path.read_text(encoding="utf-8")))
+        return cls.from_settings(json.loads(path.read_text(encoding="utf-8")))
 
 
 @dataclass(frozen=True)

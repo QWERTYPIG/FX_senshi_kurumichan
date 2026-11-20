@@ -10,23 +10,34 @@ from network import GRUSequence
 from runtime import MODEL_DIR, Config, ManagerPaths, command_parser, configure_cpu
 
 
-def train_epoch(model, optimizer, history: MarketHistory, dates, config: Config):
-    trained_dates = []
+def training_batches(history: MarketHistory, dates, config: Config):
+    return (history.batch(day, config.window_length, labels=True) for day in dates)
+
+
+def initialize_training(config: Config, num_stocks: int):
+    torch.manual_seed(config.seed)
+    model = GRUSequence(config, num_stocks)
+    return model, torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+
+
+def smooth_loss(model, batch):
+    f = model(batch)[batch.present]
+    return -(f.tanh() * batch.intraday_return[batch.present]).mean()
+
+
+def train_epoch(model, optimizer, batches):
     model.train()
-    for day in dates:
-        batch = history.batch(day, config.window_length, labels=True)
-        if not batch.present.any():
-            continue
+    for batch in batches:
         optimizer.zero_grad()
-        f = model(batch)[batch.present]
-        intraday_return = batch.intraday_return[batch.present]
-        loss = -(f.tanh() * intraday_return).mean()
-        loss.backward()
+        smooth_loss(model, batch).backward()
         optimizer.step()
-        trained_dates.append(day)
-    if not trained_dates:
-        raise ValueError("no training labels with a complete market window")
-    return min(trained_dates), max(trained_dates)
+
+
+def fit_fixed(config: Config, num_stocks: int, make_batches):
+    model, optimizer = initialize_training(config, num_stocks)
+    for _ in range(config.epochs):
+        train_epoch(model, optimizer, make_batches())
+    return model
 
 
 def main():
@@ -35,22 +46,20 @@ def main():
     args = parser.parse_args()
     config = Config.read(args.config)
     configure_cpu()
-    torch.manual_seed(config.seed)
-
     paths = ManagerPaths.read()
     history = MarketHistory(paths.history, paths.update)
-    model = GRUSequence(config, len(history.stock_ids))
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
-    for _ in range(config.epochs):
-        first_label, last_label = train_epoch(model, optimizer, history, history.dates, config)
+    dates = sorted(history.labeled_dates(config.window_length))
+    if not dates:
+        raise ValueError("no training labels with a complete market window")
+    model = fit_fixed(config, len(history.stock_ids), lambda: training_batches(history, dates, config))
 
     args.artifacts_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), args.artifacts_dir / "model.pt")
     metadata = {
         "config": asdict(config),
         "stock_ids": history.stock_ids,
-        "first_training_label_date": first_label.isoformat(),
-        "last_training_label_date": last_label.isoformat(),
+        "first_training_label_date": dates[0].isoformat(),
+        "last_training_label_date": dates[-1].isoformat(),
         "torch_version": torch.__version__,
     }
     (args.artifacts_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")

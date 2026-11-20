@@ -4,7 +4,7 @@ import csv
 import json
 from bisect import bisect_left
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import torch
@@ -24,17 +24,18 @@ OTHER_COLUMNS = (
 )
 MARKET_COLUMNS = PRICE_COLUMNS + OTHER_COLUMNS
 CLOSE, OPEN = map(MARKET_COLUMNS.index, ADJUSTED_OHLC[:2])
+MAX_MARKET_AGE = timedelta(days=10)
 
 
-def _stock_ids(history: Path) -> tuple[str, ...]:
+def read_stock_ids(history: Path, field: str) -> tuple[str, ...]:
     info = json.loads((history / "info.json").read_text(encoding="utf-8-sig"))
-    stocks = tuple(map(str, info["Top100@Y"]))
+    stocks = tuple(map(str, info[field]))
     if not stocks or len(stocks) != len(set(stocks)) or not all(stock.isascii() and stock.isdigit() for stock in stocks):
-        raise ValueError("Top100@Y in historical info.json must contain unique stock IDs")
+        raise ValueError(f"{field} in historical info.json must contain unique stock IDs")
     return stocks
 
 
-def _read_stock(stock: str, history: Path, update: Path, before: date | None) -> dict[date, list[float]]:
+def _read_stock(stock: str, history: Path, update: Path, through: date | None) -> dict[date, list[float]]:
     rows = {}
     expected = {"date", *MARKET_COLUMNS}
     for directory in (history, update):
@@ -48,7 +49,7 @@ def _read_stock(stock: str, history: Path, update: Path, before: date | None) ->
                 raise ValueError(f"{path}: unexpected market columns")
             for row in reader:
                 day = iso_date(row["date"])
-                if before is None or day < before:
+                if through is None or day <= through:
                     rows[day] = row
     return {day: [float(row[col]) if row[col] else float("nan") for col in MARKET_COLUMNS]
             for day, row in rows.items()}
@@ -67,20 +68,28 @@ class DateBatch:
 
 
 class MarketHistory:
-    def __init__(self, history: Path, update: Path, *, before: date | None = None):
-        self.stock_ids = _stock_ids(history)
+    def __init__(self, history: Path, update: Path, *, before: date | None = None,
+                 through: date | None = None):
+        if before is not None and through is not None:
+            raise ValueError("specify only one market history cutoff")
+        # Prediction excludes cutoff-day market data but can use that day's US row.
+        market_end = before - timedelta(days=1) if before is not None else through
+        self.stock_ids = read_stock_ids(history, "Top100@Y")
         self.series = []
+        self.returns = []
         trading_dates = set()
         for stock in self.stock_ids:
-            rows = _read_stock(stock, history, update, before)
+            rows = _read_stock(stock, history, update, market_end)
             days = sorted(rows)
             values = torch.tensor([rows[day] for day in days], dtype=torch.float64).reshape(-1, len(MARKET_COLUMNS))
             valid = torch.isfinite(values).all(dim=1) & (values[:, :len(ADJUSTED_OHLC)] > 0).all(dim=1)
             days = [day for day, keep in zip(days, valid.tolist()) if keep]
-            self.series.append((days, values[valid]))
+            values = values[valid]
+            self.series.append((days, values))
+            self.returns.append(values[:, CLOSE] / values[:, OPEN] - 1)
             trading_dates.update(days)
         self.dates = tuple(sorted(trading_dates))
-        self.globals = GlobalHistory(history, update, through=before)
+        self.globals = GlobalHistory(history, update, through=before if before is not None else through)
         global_rows = []
         self.global_sources = []
         previous = None
@@ -95,6 +104,18 @@ class MarketHistory:
         self.calendar_positions = {day: i for i, day in enumerate(self.dates)}
         self.global_indices = [torch.tensor([self.calendar_positions[day] for day in days], dtype=torch.long)
                                for days, _ in self.series]
+
+    def labeled_dates(self, length: int) -> set[date]:
+        return {day for days, _ in self.series for day in days[length:]}
+
+    def realized_returns(self, day: date, positions: list[int]) -> dict[int, float]:
+        returns = {}
+        for i in positions:
+            days, _ = self.series[i]
+            end = bisect_left(days, day)
+            if end < len(days) and days[end] == day:
+                returns[i] = self.returns[i][end].item()
+        return returns
 
     def batch(self, day: date, length: int, *, labels: bool = False,
               market_not_before: date | None = None) -> DateBatch:
@@ -127,7 +148,7 @@ class MarketHistory:
             window_sources = self.global_sources[self.calendar_positions[days[end - 1]]]
             global_sources.append((*us_sources, *window_sources[len(US_COLUMNS):]))
             if intraday_return is not None:
-                intraday_return[i] = values[end, CLOSE] / values[end, OPEN] - 1
+                intraday_return[i] = self.returns[i][end]
 
         # A missing stock has inert zero inputs; the mask determines whether it contributes.
         price = market[:, :, :len(PRICE_COLUMNS)]
