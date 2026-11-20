@@ -9,6 +9,7 @@
   "attention": true,
   "embedding": true,
   "embedding_size": 4,
+  "input_noise_std": 0.1,
   "search": {
     "window_length": [20, 60, 120],
     "gru_layers": [1, 2],
@@ -29,6 +30,7 @@
     ],
     "early_stopping_days": 60,
     "patience": 2,
+    "max_epochs": 5,
     "final_test_start": "2026-06-01"
   }
 }

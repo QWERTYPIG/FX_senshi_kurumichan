@@ -1,14 +1,13 @@
 """Populate the manager's Phase 1 or session template with GRU directions."""
 
 import csv
-import json
 import logging
 
 import torch
 from global_history import GLOBAL_COLUMNS
-from market import MAX_MARKET_AGE, MarketHistory
+from market import MarketHistory
 from network import GRUSequence, mean_f
-from runtime import Config, ManagerPaths, command_parser, configure_cpu, iso_date
+from runtime import CHECKPOINT_NAME, Config, ManagerPaths, command_parser, configure_cpu, iso_date
 
 
 def read_template(path):
@@ -30,7 +29,12 @@ def main():
     args = command_parser(__doc__).parse_args()
     paths = ManagerPaths.read()
     dates, target_ids = read_template(paths.template)
-    metadata = json.loads((args.artifacts_dir / "metadata.json").read_text(encoding="utf-8"))
+    checkpoint = args.artifacts_dir / CHECKPOINT_NAME
+    try:
+        snapshot = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    except FileNotFoundError:
+        raise SystemExit(f"No checkpoint at {checkpoint}; run train.py to create it") from None
+    metadata = snapshot["metadata"]
     last_label = iso_date(metadata["last_training_label_date"])
     for day in dates:
         if day <= last_label:
@@ -39,31 +43,25 @@ def main():
     configure_cpu()
     config = Config(**metadata["config"])
     history = MarketHistory(paths.history, paths.update, before=max(dates))
-    if metadata["stock_ids"] != list(history.stock_ids):
+    if metadata["stock_ids"] != history.stock_ids:
         raise ValueError("stock IDs in historical info.json differ from the training universe")
-    positions = {stock: i for i, stock in enumerate(history.stock_ids)}
-    if not set(target_ids) <= positions.keys():
-        raise ValueError("template contains stock IDs outside the training universe")
-    index = [positions[stock] for stock in target_ids]
+    index = history.stock_positions(target_ids, source="template")
 
     models = []
-    for filename in metadata.get("model_files", ["model.pt"]):
+    for seed in metadata["deployment_seeds"]:
         model = GRUSequence(config, len(history.stock_ids))
-        model.load_state_dict(torch.load(args.artifacts_dir / filename, map_location="cpu", weights_only=True))
+        model.load_state_dict(snapshot["states"][seed])
         models.append(model.eval())
 
     columns = []
     details = []
     for day in dates:
-        market_not_before = day - MAX_MARKET_AGE
-        batch = history.batch(day, config.window_length, market_not_before=market_not_before)
-        stale_stocks = [(stock, last_row) for stock, last_row in zip(history.stock_ids, batch.latest_market_date)
-                        if last_row is None or last_row < market_not_before]
-        if len(stale_stocks) == len(history.stock_ids):
+        batch = history.batch(day, config.window_length)
+        if batch.all_market_stale:
             raise SystemExit(f"{day}: all universe stocks have stale market data; no predictions written")
-        for stock, last_row in stale_stocks:
+        for position in batch.stale_market_positions:
             logging.warning("%s: stale market data for stock %s (latest valid row: %s); treating as absent",
-                            day, stock, last_row or "none")
+                            day, history.stock_ids[position], batch.latest_market_date[position] or "none")
         scores = mean_f(models, batch)
         directions = ((scores > 0) & batch.present).int()
         columns.append(directions[index].tolist())

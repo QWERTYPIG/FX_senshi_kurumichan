@@ -29,7 +29,7 @@ class CrossStockTests(unittest.TestCase):
         self.days = [f"2026-05-{day:02d}" for day in range(18, 23)] + ["2026-05-25"]
         self.config = {
             "window_length": 3, "hidden_size": 4, "gru_layers": 1,
-            "head_hidden_size": 8, "learning_rate": 0.01, "epochs": 2, "seed": 7,
+            "head_hidden_size": 8, "learning_rate": 0.01, "epochs": 2, "seed": 7, "deployment_mode": "standalone",
         }
         for stock in (self.target, self.peer):
             write_csv(self.market / f"{stock}.csv", [MARKET_HEADER, *map(market_row, self.days)])

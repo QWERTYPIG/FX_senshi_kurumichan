@@ -28,7 +28,7 @@ class GRUEvaluationTests(unittest.TestCase):
             "evaluation": {
                 "folds": [{"start": self.days[6], "end": self.days[7]},
                           {"start": self.days[8], "end": self.days[9]}],
-                "early_stopping_days": 2, "patience": 1, "final_test_start": self.test_days[0],
+                "early_stopping_days": 2, "patience": 1, "max_epochs": 2, "final_test_start": self.test_days[0],
             },
         }
         self.config.write_text(json.dumps(self.settings), encoding="utf-8")
@@ -47,7 +47,7 @@ class GRUEvaluationTests(unittest.TestCase):
             for day in self.days + self.test_days:
                 actual = test_closes[stock] if test_closes is not None and day in self.test_days else close
                 if day in self.days[4:6]:
-                    actual = 100  # First inner holdout is flat, so the earliest epoch wins the tie.
+                    actual = 100  # The first early-stopping split is flat; the earliest epoch wins the tie.
                 row = market_row(day)
                 row[1], row[3] = actual, max(103, actual)
                 rows.append(row)
@@ -110,6 +110,16 @@ class GRUEvaluationTests(unittest.TestCase):
         self.assertEqual({path.name for path in self.artifacts.iterdir()},
                          {"validation_metrics.json", "validation_predictions.csv"})
 
+    def test_validation_epoch_limit_does_not_follow_fixed_refit_epochs(self):
+        self.settings["epochs"] = 1
+        self.config.write_text(json.dumps(self.settings), encoding="utf-8")
+        result = self.run_evaluation("validate")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        metrics = self.metrics("validation")
+        self.assertEqual(metrics["config"]["epochs"], 1)
+        self.assertEqual(metrics["max_epochs"], 2)
+        self.assertEqual([fold["best_epoch"] for fold in metrics["folds"]], [1, 2])
+
     def test_final_test_is_an_explicit_report_for_frozen_config(self):
         result = self.run_evaluation("validate")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -117,7 +127,7 @@ class GRUEvaluationTests(unittest.TestCase):
 
         # Final reporting can also run independently, with no selection artifacts present.
         self.artifacts = self.root / "final"
-        self.settings["epochs"] = 3
+        self.settings.update(epochs=3, deployment_mode="standalone")
         self.config.write_text(json.dumps(self.settings), encoding="utf-8")
         result = self.run_evaluation("final-test")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -163,6 +173,7 @@ class GRUEvaluationTests(unittest.TestCase):
         self.assert_scores(metrics, ensemble, self.test_days, {"2330": 0.02, "0123": -0.01})
 
         self.settings.pop("deployment_seeds")
+        self.settings["deployment_mode"] = "standalone"
         runs = []
         for seed in seeds:
             self.settings["seed"] = seed
@@ -214,7 +225,8 @@ class GRUEvaluationTests(unittest.TestCase):
 
     def test_search_pairs_ablations_and_freezes_validation_only_selection(self):
         self.settings["search"] = {"window_length": [2, 3], "gru_layers": [1], "hidden_size": [4],
-                                   "seeds": [7, 8, 9]}
+                                   "seeds": [1, 2, 3]}
+        self.settings["evaluation"]["max_epochs"] = 6
         self.settings["deployment_seeds"] = [7, 8, 9, 10, 11]
         self.config.write_text(json.dumps(self.settings), encoding="utf-8")
         result = self.run_cli("search.py")
@@ -230,7 +242,7 @@ class GRUEvaluationTests(unittest.TestCase):
         for trial in trials.values():
             self.assertEqual([fold["fold"] for fold in trial["folds"]], [1, 2])
             for fold in trial["folds"]:
-                self.assertEqual([run["seed"] for run in fold["runs"]], [7, 8, 9])
+                self.assertEqual([run["seed"] for run in fold["runs"]], [1, 2, 3])
                 self.assertAlmostEqual(fold["contest_score"], sum(run["contest_score"] for run in fold["runs"]) / 3)
                 self.assertAlmostEqual(fold["always_down"], -0.005)
             self.assertAlmostEqual(trial["mean_contest_score"], sum(f["contest_score"] for f in trial["folds"]) / 2)
@@ -262,8 +274,21 @@ class GRUEvaluationTests(unittest.TestCase):
         self.assertEqual(report["selected_trial"], selected["id"])
         frozen = json.loads((self.artifacts / "selected_config.json").read_text())
         self.assertEqual(frozen["deployment_seeds"], [7, 8, 9, 10, 11])
-        epochs = sorted(run["best_epoch"] for fold in selected["folds"] for run in fold["runs"])
-        self.assertEqual(frozen["epochs"], (epochs[2] + epochs[3]) // 2)
+        epoch_selection = frozen["epoch_selection"]
+        self.assertEqual(epoch_selection["trial"], report["selected_trial"])
+        fold_epochs = []
+        for fold, source in zip(selected["folds"], epoch_selection["folds"], strict=True):
+            self.assertEqual(source["fold"], fold["fold"])
+            self.assertEqual(source["seed_best_epochs"], [
+                {"seed": run["seed"], "best_epoch": run["best_epoch"]} for run in fold["runs"]
+            ])
+            _, expected, _ = sorted(run["best_epoch"] for run in fold["runs"])
+            self.assertEqual(source["median_best_epoch"], expected)
+            fold_epochs.append(expected)
+        self.assertEqual(frozen["epochs"], sum(fold_epochs) // 2)
+        pooled = sorted(run["best_epoch"] for fold in selected["folds"] for run in fold["runs"])
+        self.assertNotEqual(frozen["epochs"], (pooled[2] + pooled[3]) // 2)
+        self.assertEqual(epoch_selection["refit_epochs"], frozen["epochs"])
         self.assertEqual(report["universe_stock_ids"], self.stocks)
         self.assertEqual(report["target_stock_ids"], self.targets)
         self.assertEqual(report["data_date_range"], [self.days[0], self.days[-1]])
@@ -278,6 +303,28 @@ class GRUEvaluationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(snapshot, {path.relative_to(replay): path.read_bytes()
                                     for path in replay.rglob("*") if path.is_file()})
+
+    def test_weekly_records_selected_epoch_provenance_even_after_a_fixed_override(self):
+        self.settings["search"] = {"window_length": [3], "gru_layers": [1], "hidden_size": [4],
+                                   "seeds": [7, 8, 9]}
+        self.settings["deployment_seeds"] = [7, 8, 9, 10, 11]
+        self.config.write_text(json.dumps(self.settings), encoding="utf-8")
+        result = self.run_cli("search.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.config = self.artifacts / "selected_config.json"
+        frozen = json.loads(self.config.read_text())
+        for override in (False, True):
+            with self.subTest(override=override):
+                settings = {**frozen, "epochs": frozen["epochs"] + int(override)}
+                self.config.write_text(json.dumps(settings), encoding="utf-8")
+                weekly = self.root / "weekly"
+                result = self.run_cli("train.py", artifacts=weekly)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                metadata = json.loads((weekly / "metadata.json").read_text())
+                self.assertEqual(metadata["data_date_range"], [self.days[0], self.test_days[-1]])
+                self.assertEqual(metadata["epoch_selection"], frozen["epoch_selection"])
+                self.assertEqual(metadata["epoch_source"], "fixed_override" if override else "validation")
+                self.assertEqual(metadata["config"]["epochs"], settings["epochs"])
 
     def test_search_adopts_only_the_higher_scoring_variant_when_both_qualify(self):
         self.settings["search"] = {"window_length": [2], "gru_layers": [1], "hidden_size": [4],
@@ -303,9 +350,13 @@ class GRUEvaluationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         metadata = json.loads((self.artifacts / "metadata.json").read_text(encoding="utf-8"))
         self.assertEqual(metadata["deployment_seeds"], seeds)
-        self.assertEqual(len(set(metadata["model_files"])), 5)
-        self.assertTrue(all((self.artifacts / name).is_file() for name in metadata["model_files"]))
         self.assertEqual(metadata["config"]["epochs"], 2)
+        self.assertEqual(metadata["epoch_source"], "fixed")
+        self.assertIsNone(metadata["epoch_selection"])
+        original_files = {path.relative_to(self.artifacts) for path in self.artifacts.rglob("*")}
+        result = self.run_cli("train.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual({path.relative_to(self.artifacts) for path in self.artifacts.rglob("*")}, original_files)
         self.assertEqual(metadata["stock_ids"], self.stocks)
         self.assertEqual(metadata["first_training_label_date"], self.days[3])
         self.assertEqual(metadata["last_training_label_date"], self.test_days[-1])
@@ -318,9 +369,12 @@ class GRUEvaluationTests(unittest.TestCase):
             _, *rows = read_csv(self.output.with_name("prediction_detail.csv"))
             return {row[0]: float(row[2]) for row in rows}
 
+        # The readable sidecar is not part of the prediction snapshot.
+        (self.artifacts / "metadata.json").unlink()
         actual = predict(self.artifacts)
         _, *directions = read_csv(self.output)
         self.settings.pop("deployment_seeds")
+        self.settings["deployment_mode"] = "standalone"
         single_scores = []
         for seed in seeds:
             self.settings["seed"] = seed
@@ -335,12 +389,27 @@ class GRUEvaluationTests(unittest.TestCase):
             self.assertAlmostEqual(actual[stock], expected, places=7)
             self.assertEqual(direction, str(int(expected > 0)))
 
+    def test_weekly_requires_five_seeds_unless_standalone_is_explicit(self):
+        result = self.run_cli("train.py")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("deployment_seeds must contain exactly 5 seeds", result.stderr)
+        self.assertFalse(self.artifacts.exists())
+
+        self.settings["deployment_mode"] = "standalone"
+        self.config.write_text(json.dumps(self.settings), encoding="utf-8")
+        result = self.run_cli("train.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        metadata = json.loads((self.artifacts / "metadata.json").read_text())
+        self.assertEqual(metadata["deployment_mode"], "standalone")
+        self.assertEqual(metadata["deployment_seeds"], [self.settings["seed"]])
+
     def test_weekly_fit_ignores_evaluation_settings_and_uses_latest_label(self):
+        self.settings["deployment_mode"] = "standalone"
         self.settings["evaluation"]["folds"] = []
         self.config.write_text(json.dumps(self.settings), encoding="utf-8")
         result = self.run_cli("train.py")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual({path.name for path in self.artifacts.iterdir()}, {"model.pt", "metadata.json"})
+        self.assertEqual({path.name for path in self.artifacts.iterdir()}, {"checkpoint.pt", "metadata.json"})
         metadata = json.loads((self.artifacts / "metadata.json").read_text(encoding="utf-8"))
         self.assertEqual(metadata["config"]["epochs"], 2)
         self.assertEqual(metadata["last_training_label_date"], self.test_days[-1])

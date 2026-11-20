@@ -41,7 +41,7 @@ class PredictionSafeguardsTests(unittest.TestCase):
         config_path = root / "tiny.json"
         config_path.write_text(json.dumps({
             "window_length": 3, "hidden_size": 4, "gru_layers": 1,
-            "head_hidden_size": 4, "learning_rate": 0.01, "epochs": 2, "seed": 7,
+            "head_hidden_size": 4, "learning_rate": 0.01, "epochs": 2, "seed": 7, "deployment_mode": "standalone",
         }), encoding="utf-8")
         result = self.run_command(1, "--config", str(config_path))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
