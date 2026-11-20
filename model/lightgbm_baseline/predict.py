@@ -8,6 +8,7 @@ import lightgbm as lgb
 import pandas as pd
 
 from features import DATA_DIR, HISTORY_DIR, FEATURES, FEATURE_VERSION, MODEL_DIR, TEMPLATE, build_dataset, read_template
+from us_features import US_DATA_DIR, US_FEATURES, US_FEATURE_VERSION, add_us_features, us_coverage
 
 
 def prediction_template(template_path, date, stock_ids):
@@ -28,6 +29,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
     parser.add_argument("--history-dir", type=Path, default=HISTORY_DIR)
+    parser.add_argument("--us-data-dir", type=Path, default=US_DATA_DIR)
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--template", type=Path, default=TEMPLATE,
                            help="Default: MANAGER_TEMPLATE or manager_data/template.csv")
@@ -41,8 +43,14 @@ def main():
     if not metadata_path.exists():
         raise ValueError("No trained model. Run train.py or manager's retrain action first.")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if metadata["features"] != FEATURES or metadata["feature_version"] != FEATURE_VERSION:
+    feature_set = metadata.get("feature_set", "baseline")
+    if feature_set not in ("baseline", "us"):
+        raise ValueError("Unknown feature set; retrain the model")
+    features = FEATURES + US_FEATURES if feature_set == "us" else FEATURES
+    if metadata["features"] != features or metadata["feature_version"] != FEATURE_VERSION:
         raise ValueError("Feature implementation changed; retrain the model")
+    if feature_set == "us" and metadata.get("us_feature_version") != US_FEATURE_VERSION:
+        raise ValueError("US feature implementation changed; retrain the model")
     try:
         template = prediction_template(args.template, args.date, metadata["prediction_stock_ids"])
     except ValueError as error:
@@ -63,8 +71,12 @@ def main():
     age = (frame["date"] - frame["feature_date"]).dt.days
     if frame["feature_date"].isna().any() or (age > args.max_history_age_days).any():
         raise ValueError("Missing or stale price history; synchronize data before predicting")
+    if feature_set == "us":
+        frame = add_us_features(frame, args.us_data_dir)
+        if not us_coverage(frame).all():
+            raise ValueError("US history is missing, stale or lacks rolling warm-up; run script/update_us.py")
     model = lgb.Booster(model_file=str(args.artifacts_dir / "model.txt"))
-    frame["prediction"] = (model.predict(frame[FEATURES]) > metadata["threshold"]).astype(int)
+    frame["prediction"] = (model.predict(frame[features]) > metadata["threshold"]).astype(int)
     lookup = frame.pivot(index="stock_id", columns="date", values="prediction")
     for date in dates:
         template[date] = lookup.loc[stock_ids, pd.Timestamp(date)].to_numpy()

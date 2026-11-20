@@ -113,7 +113,61 @@
 `merge_asof` 合併。這相當於依交易日 `shift(1)`，也能處理資料中尚未出現的
 下一個交易日，不會拿預測當天的開高低收當輸入。缺失指標及不足 rolling
 視窗的值保留為 NaN，交由 LightGBM 處理；沒有任何過去資料的訓練列會排除。
-全球資料尚未納入，待確認日期與發布時間後再擴充。
+`global/global_data.csv` 尚未納入。另可透過下列選項使用 FinMind 美股日線。
+
+## 美股特徵實驗
+
+先使用 repo 的下載程式（檔名是 `download_us.py`）補齊五個標的：
+
+```sh
+.venv/bin/python script/download_us.py --symbols SPY QQQ SMH TSM NVDA --start-date 2022-01-01
+```
+
+使用 SPY 大盤、QQQ 科技、SMH 半導體、TSM ADR 與 NVDA 的 22 個新特徵：
+
+- 各標的 1 日、5 日還原收盤報酬，以及台股上次有效收盤以來的累積美股報酬。
+- SMH 的 20 日波動與相對 20 日均量比。
+- QQQ／SMH 相對 SPY、TSM／NVDA 相對 SMH 的 1 日報酬差。
+- 最舊美股來源距台股預測日的日曆天數。
+
+`us_features.py` 將 CSV 日期視為紐約交易日，先計算 16:00 ET 收盤時間並處理 DST，
+再以對應台北日期 **08:10** 為資料可用時間，以台股當日 **08:25** 為預測 cutoff
+做 backward as-of join；不會使用同一日尚未發生的紐約行情。台股連假期間會累計
+美股多日變動，而不是固定 shift 一列。報酬使用 `Adj_Close`，避免把股票分割當成跌幅。
+
+**08:10 是回測假設，不是歷史發布時間證明。** [FinMind 文件](https://finmind.github.io/tutor/UnitedStatesMarket/Technical/)
+標示日線每天 08:00 更新、實際以 API 為主，CSV 不含逐日發布時間與歷史修訂版本。
+因此結果仍受資料延遲、歷史修訂及還原價事後修訂影響。即時預測只使用本機已下載
+的列；來源缺失、超過 7 個日曆日或 rolling 暖機不足時會拒絕產生 US 預測。
+
+公平比較與保存實驗模型：
+
+```sh
+.venv/bin/python experiments/lightgbm_us/run.py
+```
+
+比較三版：原本 2020 年起的 baseline、僅使用美股完整覆蓋日期的 baseline，以及相同
+覆蓋日期加入美股特徵的版本。後兩版股票日、驗證日期、參數完全相同，避免把歷史
+長度變化誤認為特徵效果。固定沿用 `artifacts/best_params.json` 的參數（若不存在則
+使用原參數），不再針對美股特徵搜尋參數。先比較 5 折、再檢查較長 10 折驗證，
+最後才評估保留 test；10 折包含原 5 折，不是獨立重複實驗。
+
+結果、參數、資料雜湊、逐折與 test 預測存在 `experiments/lightgbm_us/results/<run_id>/`。
+此指令不替換 manager 的預設模型、不提交比賽預測。
+
+也可以單獨訓練、使用保存的美股模型：
+
+```sh
+.venv/bin/python model/lightgbm_baseline/train.py --feature-set us --params model/lightgbm_baseline/artifacts/best_params.json --artifacts-dir model/lightgbm_baseline/artifacts/us_experiment
+.venv/bin/python model/lightgbm_baseline/predict.py --artifacts-dir model/lightgbm_baseline/artifacts/us_experiment --template /path/to/daily_sample_submission.csv --output model/lightgbm_baseline/prediction.csv
+```
+
+`--us-data-dir` 預設採用 `MANAGER_US_DATA_DIR`，未設定時使用 repo 的 `us_data/`。
+預測會依模型 metadata 選用 baseline 或 US 特徵。普通 `train.py` 預設仍使用原本
+14 個特徵。`usage.txt` 已切換為美股試跑模式：manager 訓練時使用 `--feature-set us`，
+沿用 `artifacts/best_params.json`，模型寫入 `artifacts/us/`，預測也讀取同一目錄。
+原本 `artifacts/model.txt` 與相關單模型結果保留。需要回到原版時，將 usage.txt
+前兩行改回 `python predict.py`、`python train.py`。
 
 ## 驗證設計
 

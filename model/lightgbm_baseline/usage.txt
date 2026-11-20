@@ -1,2 +1,2 @@
-python predict.py
-python train.py
+python predict.py --artifacts-dir artifacts/us
+python train.py --feature-set us --params artifacts/best_params.json --artifacts-dir artifacts/us
