@@ -1,9 +1,9 @@
 """Shared manager paths, configuration and CPU runtime setup."""
 
 import argparse
-import json
 import math
 import os
+import platform
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -41,19 +41,40 @@ class Config:
             value = getattr(self, field)
             if type(value) is not int or value < 1:
                 raise ValueError(f"{field} must be a positive integer")
-        if type(self.seed) is not int or not 0 <= self.seed < 2**64:
-            raise ValueError("seed must be an unsigned 64-bit integer")
+        validate_seed(self.seed)
         if (type(self.learning_rate) not in (int, float)
                 or not math.isfinite(self.learning_rate) or self.learning_rate <= 0):
             raise ValueError("learning_rate must be positive and finite")
 
     @classmethod
     def from_settings(cls, settings):
-        return cls(**{key: value for key, value in settings.items() if key != "evaluation"})
+        sections = {"evaluation", "search", "deployment_seeds"}
+        return cls(**{key: value for key, value in settings.items() if key not in sections})
 
-    @classmethod
-    def read(cls, path: Path):
-        return cls.from_settings(json.loads(path.read_text(encoding="utf-8")))
+
+def validate_seed(seed):
+    if type(seed) is not int or not 0 <= seed < 2**64:
+        raise ValueError("seed must be an unsigned 64-bit integer")
+
+
+def read_seeds(values, count, field):
+    if not isinstance(values, list) or len(values) != count:
+        raise ValueError(f"{field} must contain exactly {count} seeds")
+    for seed in values:
+        validate_seed(seed)
+    if len(set(values)) != count:
+        raise ValueError(f"{field} seeds must be distinct")
+    return tuple(values)
+
+
+def deployment_seeds(settings, config):
+    if "deployment_seeds" not in settings:
+        return (config.seed,)  # Preserve single-seed configs for isolated runs.
+    return read_seeds(settings["deployment_seeds"], 5, "deployment_seeds")
+
+
+def package_versions():
+    return {"python": platform.python_version(), "torch": torch.__version__}
 
 
 @dataclass(frozen=True)

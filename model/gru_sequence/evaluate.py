@@ -11,8 +11,9 @@ from statistics import median
 
 import torch
 from market import MAX_MARKET_AGE, MarketHistory, read_stock_ids
-from runtime import MODEL_DIR, Config, ManagerPaths, configure_cpu, iso_date
-from train import fit_fixed, initialize_training, smooth_loss, train_epoch
+from network import mean_f
+from runtime import MODEL_DIR, Config, ManagerPaths, configure_cpu, deployment_seeds, iso_date, package_versions
+from train import TrainingBatches, fit_ensemble, fit_fixed, initialize_training, smooth_loss, train_epoch
 
 
 @dataclass(frozen=True)
@@ -45,29 +46,6 @@ class EvaluationPlan:
             "folds": tuple(Fold(**{key: iso_date(value) for key, value in fold.items()}) for fold in settings["folds"]),
             "final_test_start": iso_date(settings["final_test_start"]),
         })
-
-
-class _TrainingBatches:
-    """Reuse normalized labeled batches across epochs and overlapping fold fits, within a memory budget."""
-
-    def __init__(self, history: MarketHistory, config: Config):
-        self.history = history
-        self.length = config.window_length
-        self.cached = {}
-        self.remaining_bytes = 256 * 1024**2
-
-    def for_dates(self, dates):
-        for day in dates:
-            batch = self.cached.get(day)
-            if batch is None:
-                batch = self.history.batch(day, self.length, labels=True)
-                # The sequence dominates memory; include the other tensors and provenance pointers.
-                size = batch.sequence.nbytes + batch.today.nbytes + batch.present.nbytes + batch.intraday_return.nbytes
-                size += 1024 + 128 * len(batch.present)
-                if size <= self.remaining_bytes:
-                    self.cached[day] = batch
-                    self.remaining_bytes -= size
-            yield batch
 
 
 @dataclass(frozen=True)
@@ -128,8 +106,9 @@ def _target_positions(history, target_ids):
 
 
 @torch.no_grad()
-def _score(model, history, config, dates, target_positions):
-    model.eval()
+def _score(models, history, config, dates, target_positions):
+    for model in models:
+        model.eval()
     rows = []
     for day in dates:
         realized = history.realized_returns(day, target_positions)
@@ -140,7 +119,7 @@ def _score(model, history, config, dates, target_positions):
         batch = history.batch(day, config.window_length, market_not_before=not_before)
         if all(last is None or last < not_before for last in batch.latest_market_date):
             raise ValueError(f"{day}: all universe stocks have stale market data")
-        scores = model(batch).tolist()
+        scores = mean_f(models, batch).tolist()
         for i, intraday_return in realized.items():
             f = scores[i]
             if not math.isfinite(f) or not math.isfinite(intraday_return):
@@ -161,7 +140,9 @@ def _dates(days):
 
 def _run_metadata(history, targets, config, final_test_start):
     return {"config": asdict(config), "universe_stock_ids": history.stock_ids, "target_stock_ids": targets,
-            "final_test_start": final_test_start.isoformat(), "torch_version": torch.__version__}
+            "data_date_range": _dates((history.dates[0], history.dates[-1])),
+            "final_test_start": final_test_start.isoformat(), "torch_version": torch.__version__,
+            "package_versions": package_versions()}
 
 
 def evaluate_validation(paths: ManagerPaths, config: Config, plan: EvaluationPlan):
@@ -172,13 +153,13 @@ def evaluate_validation(paths: ManagerPaths, config: Config, plan: EvaluationPla
     target_positions = _target_positions(history, targets)
     labeled = history.labeled_dates(config.window_length)
     splits = [_split_dates(history.dates, fold, plan.early_stopping_days, labeled) for fold in plan.folds]
-    batches = _TrainingBatches(history, config)
+    batches = TrainingBatches(history, config)
     num_stocks = len(history.stock_ids)
     folds, predictions = [], []
     for number, (fold, dates) in enumerate(zip(plan.folds, splits), start=1):
         epoch = _best_epoch(config, plan.patience, num_stocks, batches, dates.inner_fit, dates.usable_early_stopping)
         model = fit_fixed(replace(config, epochs=epoch), num_stocks, lambda: batches.for_dates(dates.training))
-        scores, rows = _score(model, history, config, dates.validation, target_positions)
+        scores, rows = _score((model,), history, config, dates.validation, target_positions)
         folds.append({"fold": number, "start": fold.start.isoformat(), "end": fold.end.isoformat(),
                       "training_dates": _dates(dates.training), "inner_fit_dates": _dates(dates.inner_fit),
                       "early_stopping_dates": _dates(dates.early_stopping), "validation_dates": _dates(dates.validation),
@@ -190,8 +171,9 @@ def evaluate_validation(paths: ManagerPaths, config: Config, plan: EvaluationPla
             "folds": folds, "refit_epochs": refit_epochs}, predictions
 
 
-def report_final_test(paths: ManagerPaths, config: Config, final_test_start: date):
-    """Fit the frozen configuration without test rows; then score it on the final test period."""
+def report_final_test(paths: ManagerPaths, config: Config, final_test_start: date, seeds=None):
+    """Fit the frozen seed ensemble before the final test period; then score mean f."""
+    seeds = (config.seed,) if seeds is None else seeds
     configure_cpu()
     pre_test = MarketHistory(paths.history, paths.update, through=final_test_start - timedelta(days=1))
     training_dates = sorted(pre_test.labeled_dates(config.window_length))
@@ -200,8 +182,8 @@ def report_final_test(paths: ManagerPaths, config: Config, final_test_start: dat
     targets = read_stock_ids(paths.history, "Top50@Y")
     target_positions = _target_positions(pre_test, targets)
     metadata = _run_metadata(pre_test, targets, config, final_test_start)
-    batches = _TrainingBatches(pre_test, config)
-    model = fit_fixed(config, len(pre_test.stock_ids), lambda: batches.for_dates(training_dates))
+    batches = TrainingBatches(pre_test, config)
+    models = fit_ensemble(config, seeds, len(pre_test.stock_ids), lambda: batches.for_dates(training_dates))
     del batches, pre_test
 
     history = MarketHistory(paths.history, paths.update)
@@ -210,11 +192,12 @@ def report_final_test(paths: ManagerPaths, config: Config, final_test_start: dat
     dates = [day for day in history.dates if day >= final_test_start]
     if not dates:
         raise ValueError(f"no trading dates in the final test period starting {final_test_start}")
-    scores, rows = _score(model, history, config, dates, target_positions)
-    return {**metadata, "training_dates": _dates(training_dates), "test_dates": _dates(dates), **scores}, rows
+    scores, rows = _score(models, history, config, dates, target_positions)
+    return {**metadata, "deployment_seeds": seeds, "training_dates": _dates(training_dates),
+            "test_dates": _dates(dates), **scores}, rows
 
 
-def _write_report(directory, period, metrics, predictions, *, mode):
+def write_report(directory, period, metrics, predictions, *, mode):
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / f"{period}_predictions.csv").open(mode, encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(predictions[0]))
@@ -237,13 +220,14 @@ def main():
     paths, config, evaluation = ManagerPaths.read(), Config.from_settings(settings), settings["evaluation"]
     if args.mode == "validate":
         metrics, predictions = evaluate_validation(paths, config, EvaluationPlan.from_settings(evaluation))
-        _write_report(args.artifacts_dir, "validation", metrics, predictions, mode="w")
+        write_report(args.artifacts_dir, "validation", metrics, predictions, mode="w")
     else:
         for filename in ("final_test_metrics.json", "final_test_predictions.csv"):
             if (args.artifacts_dir / filename).exists():
                 raise SystemExit(f"Final-test artifacts already exist in {args.artifacts_dir}")
-        metrics, predictions = report_final_test(paths, config, iso_date(evaluation["final_test_start"]))
-        _write_report(args.artifacts_dir, "final_test", metrics, predictions, mode="x")
+        metrics, predictions = report_final_test(paths, config, iso_date(evaluation["final_test_start"]),
+                                                 deployment_seeds(settings, config))
+        write_report(args.artifacts_dir, "final_test", metrics, predictions, mode="x")
 
 
 if __name__ == "__main__":
