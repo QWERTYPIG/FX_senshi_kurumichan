@@ -1,6 +1,6 @@
 # GRU sequence experiments
 
-Real-data selection and final test for [#16](https://github.com/QWERTYPIG/FX_senshi_kurumichan/issues/16). This record also documents the ablation decisions required by [ADR 0001](../../docs/adr/0001-feature-changes-require-walk-forward-evidence.md).
+Real-data selection and final test for [#16](https://github.com/QWERTYPIG/FX_senshi_kurumichan/issues/16). This record also documents the ablation decisions required by [ADR 0001](https://github.com/QWERTYPIG/FX_senshi_kurumichan/blob/14520d68d5bd30ec19170e7c5cb47e0dc77c8f70/docs/adr/0001-feature-changes-require-walk-forward-evidence.md).
 
 ## Walk-forward setup
 
