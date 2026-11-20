@@ -39,7 +39,7 @@ def main():
 
     paths = ManagerPaths.read()
     history = MarketHistory(paths.history, paths.update)
-    model = GRUSequence(config)
+    model = GRUSequence(config, len(history.stock_ids))
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     for _ in range(config.epochs):
         first_label, last_label = train_epoch(model, optimizer, history, history.dates, config)

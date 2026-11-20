@@ -20,11 +20,16 @@ This document records the market baseline from [#10](https://github.com/QWERTYPI
 
 ## Network and training objective
 
-One shared GRU encodes every stock's market and global window. An MLP maps the final state and the shared today vector to a scalar `f`. Sharing lets the model learn common patterns over all universe stocks without using a stock's identity. A recurrent encoder is a starting point for using time-ordered data directly: the Alpha360 benchmark cited in #9 reports stronger results for a GRU than a temporal Transformer, and Fischer & Krauss (2018, *European Journal of Operational Research*) found recurrent models useful on stock direction. This is motivation, not validation on this competition's data.
+One shared GRU encodes each stock's market and global window, learning common patterns across the universe. The Alpha360 benchmark cited in #9 reports stronger results for a GRU than a temporal Transformer, and Fischer & Krauss (2018, *European Journal of Operational Research*) found recurrent models useful on stock direction.
+
+- **Cross-stock attention:** Each stock's GRU summary receives a residual update from one self-attention layer over the present universe stocks on that date. MASTER (Li et al., AAAI 2024) motivates aggregating inter-stock information to model the market and relative components together. Zeng et al. (AAAI 2023) motivate keeping the ordered time axis recurrent; the cross-section has no inherent order. The batch's presence mask excludes absent stocks as queries, keys, and values.
+- **Stock ID embedding:** An embedding indexed by the saved universe order lets the model learn persistent stock-specific drift. The historical per-stock mean intraday return correlated 0.53 between 2020–2023H1 and 2023H2–2026 (see #9). The MLP takes the summary, embedding and today vector concatenated together and produces scalar `f`.
+
+Attention and embedding are enabled by default and can be disabled separately for ablations. The cited evidence motivates testing them, not adoption without walk-forward results. Retrain checkpoints created before these settings were added.
 
 One batch is one trading date, and only present stocks contribute to the loss. The [competition score](../../docs/final-project-statement.md#evaluation) multiplies a signed direction by the realized intraday return. Replacing the hard sign with `tanh(f)` gives the differentiable loss `-mean(tanh(f) * (adjusted_close / adjusted_open - 1))`. Recompute the return on the label date rather than using `y`, which cannot encode the return's magnitude. At prediction, direction is `1` only when `f > 0`; there is no tuned threshold.
 
-The manager training command uses the exact JSON settings, with fixed epochs, one seed and deterministic single-threaded CPU execution. The checked-in values are provisional. Attention and embeddings, prediction safeguards, walk-forward selection and multi-seed refitting are later tickets. In particular, do not treat predictions for dates on or before `last_training_label_date` as out-of-sample.
+The manager training command uses the exact JSON settings, with fixed epochs, one seed and deterministic single-threaded CPU execution. The checked-in values are provisional. Prediction safeguards, walk-forward selection and multi-seed refitting are later tickets. In particular, do not treat predictions for dates on or before `last_training_label_date` as out-of-sample.
 
 ## Running and artifacts
 

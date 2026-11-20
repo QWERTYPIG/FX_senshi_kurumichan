@@ -40,7 +40,7 @@ def main():
         raise ValueError("template contains stock IDs outside the training universe")
     index = [positions[stock] for stock in target_ids]
 
-    model = GRUSequence(config)
+    model = GRUSequence(config, len(history.stock_ids))
     model.load_state_dict(torch.load(args.artifacts_dir / "model.pt", map_location="cpu", weights_only=True))
     model.eval()
 
