@@ -5,6 +5,7 @@ script/__pycache__/
 data/
 basic_data/
 manager_data/
+/gru16-results/
 data.zip
 **/__pycache__/
 model/*/prediction.csv
