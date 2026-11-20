@@ -4,9 +4,10 @@ import csv
 import json
 
 import torch
-from market import MarketHistory, iso_date
+from global_history import GLOBAL_COLUMNS
+from market import MarketHistory
 from network import GRUSequence
-from runtime import Config, ManagerPaths, command_parser, configure_cpu
+from runtime import Config, ManagerPaths, command_parser, configure_cpu, iso_date
 
 
 def read_template(path):
@@ -52,14 +53,16 @@ def main():
         columns.append(directions[index].tolist())
         for stock, i in zip(target_ids, index):
             if batch.present[i]:
-                details.append((stock, day, scores[i].item(), batch.latest_market_date[i]))
+                details.append((stock, day, scores[i].item(), batch.latest_market_date[i],
+                                *batch.latest_global_dates[i]))
             else:
-                details.append((stock, day, "", ""))
+                details.append((stock, day, "", "", *batch.latest_global_dates[i]))
 
     detail_path = paths.output.with_name(f"{paths.output.stem}_detail.csv")
     with detail_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(("id", "date", "f", "latest_market_date"))
+        global_headers = [f"latest_{column.removeprefix('^').lower()}_date" for column in GLOBAL_COLUMNS]
+        writer.writerow(("id", "date", "f", "latest_market_date", *global_headers))
         writer.writerows(details)
 
     with paths.output.open("w", encoding="utf-8", newline="") as handle:

@@ -22,6 +22,13 @@ MARKET_HEADER = (
     "RSI", "SMA", "MACD", "ATR", "BBANDS_upper", "BBANDS_mid", "BBANDS_lower", "y",
 )
 
+GLOBAL_HEADER = ("date", "^VIX", "^IXIC", "^GSPC", "^TWII", "^KS11", "TX_OI")
+
+
+def global_row(day):
+    return [f"2026-05-{day:02d}", 15 + day / 3, 10_000 + 37 * day, 4000 + day**2,
+            20_000 + 51 * day, 2000 + 13 * day, 10_000 + 100 * day]
+
 
 def market_row(date, base=100):
     return [date, base + 2, base, base + 3, base - 1, 1000, 27500, 10000,
@@ -56,6 +63,10 @@ class GRUSequencePipelineTests(unittest.TestCase):
         self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
         for data_dir in (self.history, self.update):
             (data_dir / "market").mkdir(parents=True)
+            (data_dir / "global").mkdir()
+        write_csv(self.global_file(self.history), [GLOBAL_HEADER, *map(global_row, range(18, 23)),
+                                                   global_row(26)])
+        write_csv(self.global_file(self.update), [GLOBAL_HEADER, *map(global_row, (22, 25, 26, 27))])
         (self.history / "info.json").write_text(json.dumps({
             "Top100@Y": self.stocks,
             "Top50@Y": self.targets,
@@ -67,6 +78,17 @@ class GRUSequencePipelineTests(unittest.TestCase):
             write_csv(self.market_file(self.update, stock), [MARKET_HEADER, *[
                 market_row(f"2026-05-{day:02d}", 102 + day * (i + 1)) for day in (22, 25)
             ]])
+
+    def global_file(self, data_dir):
+        return data_dir / "global" / "global_data.csv"
+
+    def edit_global(self, data_dir, day, **values):
+        path = self.global_file(data_dir)
+        header, *rows = read_csv(path)
+        row, = (row for row in rows if row[0] == day)
+        for col, value in values.items():
+            row[header.index(col)] = value
+        write_csv(path, [header, *rows])
 
     def market_file(self, data_dir, stock):
         return data_dir / "market" / f"{stock}.csv"
@@ -103,7 +125,82 @@ class GRUSequencePipelineTests(unittest.TestCase):
         self.assertEqual(len(indexed), len(rows))
         return indexed
 
-    def test_stock_rows_on_or_after_prediction_date_cannot_change_its_scores(self):
+    def test_same_date_us_session_informs_score_from_update_row(self):
+        day = "2026-05-26"
+        self.train()
+        self.predict(day)
+        before = self.details()
+        self.assertEqual({row["latest_gspc_date"] for row in before.values()}, {day})
+
+        self.edit_global(self.history, day, **{"^GSPC": 80_000})
+        self.predict(day)
+        self.assertEqual(self.details(), before)
+
+        self.edit_global(self.update, day, **{"^GSPC": 700})
+        self.predict(day)
+        self.assertTrue(any(row["f"] != before[key]["f"] for key, row in self.details().items()))
+
+    def test_global_window_uses_each_trading_days_information_cutoff(self):
+        day = "2026-05-26"
+        self.train()
+        self.predict(day)
+        before = self.details()
+
+        # Non-US data dated on the final window day (May 25) misses that day's cutoff.
+        self.edit_global(self.update, "2026-05-25", **{"^TWII": 2000})
+        self.predict(day)
+        self.assertEqual(self.details(), before)
+
+        # Non-US data from May 22 is available on May 25, but never in the today vector.
+        self.edit_global(self.update, "2026-05-22", **{"^TWII": 2000})
+        self.predict(day)
+        self.assertTrue(any(row["f"] != before[key]["f"] for key, row in self.details().items()))
+
+        # Move only the May 22 US observation to Saturday: this misses Friday's
+        # cutoff but keeps the same values for Monday and for the today vector.
+        self.edit_global(self.update, "2026-05-22", **{"^TWII": global_row(22)[4]})
+        self.edit_global(self.update, "2026-05-22", **{"^GSPC": ""})
+        saturday = ["2026-05-23", "", "", global_row(22)[3], "", "", ""]
+        path = self.global_file(self.update)
+        write_csv(path, [*read_csv(path), saturday])
+        self.predict(day)
+        self.assertTrue(any(row["f"] != before[key]["f"] for key, row in self.details().items()))
+
+    def test_us_holiday_matches_carried_levels_and_traces_actual_source_dates(self):
+        day = "2026-05-26"
+        # Remove one series at an earlier cutoff, then remove the entire global row
+        # at today's cutoff in both directories. Taiwan still has a prediction date.
+        self.edit_global(self.update, "2026-05-25", **{"^IXIC": ""})
+        for data_dir in (self.history, self.update):
+            path = self.global_file(data_dir)
+            write_csv(path, [row for row in read_csv(path) if row[0] != day])
+        self.train()
+        self.assertEqual(self.predict(day)[0], ["id", day])
+        before = self.details()
+        for row in before.values():
+            self.assertTrue(math.isfinite(float(row["f"])))
+            self.assertEqual({key: row[key] for key in (
+                "latest_gspc_date", "latest_ixic_date", "latest_vix_date",
+                "latest_twii_date", "latest_ks11_date", "latest_tx_oi_date",
+            )}, {
+                "latest_gspc_date": "2026-05-25",
+                "latest_ixic_date": "2026-05-22",
+                "latest_vix_date": "2026-05-25",
+                "latest_twii_date": "2026-05-22",
+                "latest_ks11_date": "2026-05-22",
+                "latest_tx_oi_date": "2026-05-22",
+            })
+
+        self.edit_global(self.update, "2026-05-25", **{"^IXIC": global_row(22)[2]})
+        path = self.global_file(self.update)
+        repeated = [day, global_row(25)[1], global_row(22)[2], global_row(25)[3], "", "", ""]
+        write_csv(path, [*read_csv(path), repeated])
+        self.predict(day)
+        for key, row in self.details().items():
+            self.assertEqual(row["f"], before[key]["f"])
+            self.assertEqual(row["latest_ixic_date"], day)
+
+    def test_unavailable_stock_and_global_rows_cannot_change_scores(self):
         self.train()
         day, later = "2026-05-26", "2026-05-28"
         for stock in self.stocks:
@@ -129,6 +226,14 @@ class GRUSequencePipelineTests(unittest.TestCase):
                     if row[0] >= day:
                         row[1:] = [rng.uniform(1, 1000) for _ in row[1:]]
                 write_csv(path, [header, *rows])
+            path = self.global_file(data_dir)
+            header, *rows = read_csv(path)
+            for row in rows:
+                columns = ("^TWII", "^KS11", "TX_OI") if row[0] == day else header[1:]
+                if row[0] >= day:
+                    for column in columns:
+                        row[header.index(column)] = rng.uniform(1, 1000)
+            write_csv(path, [header, *rows])
         self.predict(day, later)
         updated = self.details()
         for stock in self.targets:

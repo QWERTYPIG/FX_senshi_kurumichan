@@ -5,11 +5,19 @@ import json
 import math
 import os
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import torch
 
 MODEL_DIR = Path(__file__).resolve().parent
+
+
+def iso_date(value: str) -> date:
+    parsed = date.fromisoformat(value)
+    if parsed.isoformat() != value:
+        raise ValueError(f"expected YYYY-MM-DD date, got {value!r}")
+    return parsed
 
 
 @dataclass(frozen=True)
