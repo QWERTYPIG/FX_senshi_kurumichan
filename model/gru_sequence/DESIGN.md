@@ -24,7 +24,7 @@ One shared GRU encodes every stock's market and global window. An MLP maps the f
 
 One batch is one trading date, and only present stocks contribute to the loss. The [competition score](../../docs/final-project-statement.md#evaluation) multiplies a signed direction by the realized intraday return. Replacing the hard sign with `tanh(f)` gives the differentiable loss `-mean(tanh(f) * (adjusted_close / adjusted_open - 1))`. Recompute the return on the label date rather than using `y`, which cannot encode the return's magnitude. At prediction, direction is `1` only when `f > 0`; there is no tuned threshold.
 
-The manager training command uses the exact JSON settings, with fixed epochs, one seed and deterministic single-threaded CPU execution. The checked-in values are provisional. Attention and embeddings, prediction safeguards, walk-forward selection and multi-seed refitting are later tickets. In particular, do not treat predictions for dates on or before `last_training_label_date` as out-of-sample.
+The manager training command uses the exact JSON settings, with fixed epochs, one seed and deterministic single-threaded CPU execution. The checked-in values are provisional. Attention and embeddings, walk-forward selection and multi-seed refitting are later tickets.
 
 ## Running and artifacts
 
@@ -38,3 +38,9 @@ python predict.py --artifacts-dir /path/to/run
 Without overrides, training reads `config.json` beside the model and both commands use its local `artifacts/` directory. Training saves `model.pt` and `metadata.json` (settings used, universe stock IDs, actual first/last training label dates and PyTorch version). Retrain any market-only checkpoint from #10: the wider GRU and head are not compatible with its weights. Prediction uses the saved settings and rewrites `MANAGER_OUTPUT`. For a cutoff audit, inspect the sibling `<output-stem>_detail.csv`: every target stock-date has an `f` and a `latest_*_date` field for market history and for each global series. Stocks without a complete window receive direction `0` and blank scores and traces.
 
 The synthetic subprocess tests exercise both manager commands and templates, date causality, deterministic retraining, config overrides, the return objective, update precedence and expansion without modifying the source files. They do not estimate contest performance.
+
+## Prediction safeguards
+
+- **Stale stock:** Compare each universe stock's latest valid market row strictly before the prediction date to that date. More than 10 calendar days old (or no prior valid row) is stale; exactly 10 days is eligible. Warn for each stale stock and mark it absent before inference, so it cannot influence other stocks. For a stale target stock, write direction `0` with a blank score and source dates.
+- **All stocks stale:** If every universe stock is stale on any requested date, exit nonzero with that date in the error. Leave both prediction files untouched, even if other dates in the template could be scored.
+- **In-sample date:** Require every prediction date to be strictly after the checkpoint's `last_training_label_date`. If a date fails that check, exit nonzero before writing either output.
