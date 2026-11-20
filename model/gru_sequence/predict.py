@@ -2,12 +2,16 @@
 
 import csv
 import json
+import logging
+from datetime import timedelta
 
 import torch
 from global_history import GLOBAL_COLUMNS
 from market import MarketHistory
 from network import GRUSequence
 from runtime import Config, ManagerPaths, command_parser, configure_cpu, iso_date
+
+MAX_MARKET_AGE = timedelta(days=10)
 
 
 def read_template(path):
@@ -29,8 +33,13 @@ def main():
     args = command_parser(__doc__).parse_args()
     paths = ManagerPaths.read()
     dates, target_ids = read_template(paths.template)
-    configure_cpu()
     metadata = json.loads((args.artifacts_dir / "metadata.json").read_text(encoding="utf-8"))
+    last_label = iso_date(metadata["last_training_label_date"])
+    for day in dates:
+        if day <= last_label:
+            raise SystemExit(f"prediction date {day} must be after the last training label date {last_label}")
+
+    configure_cpu()
     config = Config(**metadata["config"])
     history = MarketHistory(paths.history, paths.update, before=max(dates))
     if metadata["stock_ids"] != list(history.stock_ids):
@@ -47,7 +56,15 @@ def main():
     columns = []
     details = []
     for day in dates:
-        batch = history.batch(day, config.window_length)
+        market_not_before = day - MAX_MARKET_AGE
+        batch = history.batch(day, config.window_length, market_not_before=market_not_before)
+        stale_stocks = [(stock, last_row) for stock, last_row in zip(history.stock_ids, batch.latest_market_date)
+                        if last_row is None or last_row < market_not_before]
+        if len(stale_stocks) == len(history.stock_ids):
+            raise SystemExit(f"{day}: all universe stocks have stale market data; no predictions written")
+        for stock, last_row in stale_stocks:
+            logging.warning("%s: stale market data for stock %s (latest valid row: %s); treating as absent",
+                            day, stock, last_row or "none")
         scores = model(batch)
         directions = ((scores > 0) & batch.present).int()
         columns.append(directions[index].tolist())
