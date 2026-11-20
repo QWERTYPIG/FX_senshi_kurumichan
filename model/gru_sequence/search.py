@@ -3,8 +3,11 @@
 import argparse
 import json
 import math
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 from itertools import product
+from multiprocessing import get_context
 from operator import itemgetter
 from pathlib import Path
 from statistics import median
@@ -14,7 +17,8 @@ from runtime import MODEL_DIR, SEARCH_SEED_COUNT, Config, ManagerPaths, deployme
 
 GRID_STAGE, ABLATION_STAGE = 1, 2
 GRID_FIELDS = ("window_length", "gru_layers", "hidden_size")
-FOLD_FIELDS = ("fold", "start", "end", "validation_dates", "row_count", "always_up", "always_down")
+FOLD_FIELDS = ("fold", "start", "end", "validation_dates", "row_count", "always_up", "always_down",
+               "all_market_stale_dates")
 
 
 def grid(settings, base):
@@ -30,11 +34,32 @@ def grid(settings, base):
             for values in product(*axes)]
 
 
-def run_trial(paths, plan, seeds, directory, trial_id, stage, config):
+def run_seed(paths, plan, directory, trial_id, config):
+    metrics, predictions = evaluate_validation(paths, config, plan)
+    write_report(directory / trial_id / str(config.seed), "validation", metrics, predictions, mode="x")
+    return metrics
+
+
+def run_stage(pool, paths, plan, seeds, directory, stage, candidates):
+    jobs = {(trial_id, seed): (paths, plan, directory, trial_id, replace(config, seed=seed))
+            for trial_id, config in candidates for seed in seeds}
+    if pool is None:
+        results = {key: run_seed(*args) for key, args in jobs.items()}
+    else:
+        futures = {pool.submit(run_seed, *args): key for key, args in jobs.items()}
+        try:
+            results = {futures[future]: future.result() for future in as_completed(futures)}
+        finally:
+            for future in futures:
+                future.cancel()
+    # Keep configured candidate and seed order no matter which worker finishes first.
+    return [aggregate_trial(trial_id, stage, config, seeds, results) for trial_id, config in candidates]
+
+
+def aggregate_trial(trial_id, stage, config, seeds, results):
     folds = {}
     for seed in seeds:
-        metrics, predictions = evaluate_validation(paths, replace(config, seed=seed), plan)
-        write_report(directory / trial_id / str(seed), "validation", metrics, predictions, mode="x")
+        metrics = results[trial_id, seed]
         for fold in metrics["folds"]:
             identity = {field: fold[field] for field in FOLD_FIELDS}
             aggregate = folds.setdefault(fold["fold"], {**identity, "runs": []})
@@ -76,7 +101,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=MODEL_DIR / "config.json")
     parser.add_argument("--artifacts-dir", type=Path, required=True)
+    parser.add_argument("--workers", type=int, default=1, help="number of parallel CPU workers (default: 1)")
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be a positive integer")
     settings = json.loads(args.config.read_text(encoding="utf-8"))
     base = Config.from_settings(settings)
     candidates = grid(settings["search"], base)
@@ -89,17 +117,22 @@ def main():
     if any(directory.iterdir()):
         parser.error("--artifacts-dir must be empty for a new search")
 
-    trials = []
-    for number, config in enumerate(candidates, start=1):
-        trial, metadata = run_trial(paths, plan, seeds, directory, f"grid-{number}", GRID_STAGE, config)
-        trials.append(trial)
     rank = itemgetter("mean_contest_score")
-    winner = max(trials, key=rank)
+    switches = ("attention", "embedding")
+    # Spawn fresh processes instead of forking a process that has imported PyTorch.
+    executor = ProcessPoolExecutor(args.workers, mp_context=get_context("spawn")) if args.workers > 1 else nullcontext()
+    with executor as pool:
+        grid_candidates = [(f"grid-{number}", config) for number, config in enumerate(candidates, start=1)]
+        grid_results = run_stage(pool, paths, plan, seeds, directory, GRID_STAGE, grid_candidates)
+        trials = [trial for trial, _ in grid_results]
+        metadata = grid_results[-1][1]
+        winner = max(trials, key=rank)
+        winning_config = Config(**winner["config"])
+        ablation_candidates = [(f"no-{switch}", replace(winning_config, **{switch: False})) for switch in switches]
+        ablation_results = run_stage(pool, paths, plan, seeds, directory, ABLATION_STAGE, ablation_candidates)
 
     eligible, ablations = [], []
-    for switch in ("attention", "embedding"):
-        config = replace(Config(**winner["config"]), **{switch: False})
-        trial, _ = run_trial(paths, plan, seeds, directory, f"no-{switch}", ABLATION_STAGE, config)
+    for switch, (trial, _) in zip(switches, ablation_results, strict=True):
         trials.append(trial)
         decision = compare_ablation(winner, trial, switch)
         ablations.append(decision)

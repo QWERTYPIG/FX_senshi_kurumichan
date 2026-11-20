@@ -207,6 +207,20 @@ class GRUEvaluationTests(unittest.TestCase):
         self.assertEqual(changed["best_epoch"], first["best_epoch"])
         self.assertEqual([row["f"] for row in self.predictions("validation") if row["date"] == day], before)
 
+    def test_validation_keeps_labeled_dates_after_an_all_market_gap(self):
+        self.days[:6] = [f"2026-05-{day:02d}" for day in range(4, 10)]
+        self.write_prices()
+
+        result = self.run_evaluation("validate")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        first, second = self.metrics("validation")["folds"]
+        self.assertEqual(first["all_market_stale_dates"], [self.days[6]])
+        self.assertEqual(second["all_market_stale_dates"], [])
+        rows = [row for row in self.predictions("validation") if row["fold"] == "1"]
+        self.assert_scores(first, rows, self.days[6:8], {"2330": 0.02, "0123": -0.01})
+        gap_rows = [row for row in rows if row["date"] == self.days[6]]
+        self.assertTrue(all(row["direction"] == "0" and float(row["f"]) == 0 for row in gap_rows))
+
     def test_labeled_target_without_a_window_still_counts_for_all_scores(self):
         path = self.history / "market/0123.csv"
         header, *rows = read_csv(path)
@@ -303,6 +317,22 @@ class GRUEvaluationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(snapshot, {path.relative_to(replay): path.read_bytes()
                                     for path in replay.rglob("*") if path.is_file()})
+
+    def test_parallel_search_produces_identical_artifacts_to_serial_search(self):
+        self.settings["search"] = {"window_length": [2, 3], "gru_layers": [1], "hidden_size": [4],
+                                   "seeds": [9, 7, 8]}
+        self.settings["deployment_seeds"] = [7, 8, 9, 10, 11]
+        self.config.write_text(json.dumps(self.settings), encoding="utf-8")
+        snapshots = []
+        for workers in (1, 3):
+            artifacts = self.root / f"search-{workers}"
+            result = self.run_cli("search.py", "--workers", str(workers), artifacts=artifacts)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            snapshots.append({path.relative_to(artifacts): path.read_bytes()
+                              for path in artifacts.rglob("*") if path.is_file()})
+        self.assertIn(Path("search_metrics.json"), snapshots[0])
+        self.assertIn(Path("selected_config.json"), snapshots[0])
+        self.assertEqual(snapshots[0], snapshots[1])
 
     def test_weekly_records_selected_epoch_provenance_even_after_a_fixed_override(self):
         self.settings["search"] = {"window_length": [3], "gru_layers": [1], "hidden_size": [4],
