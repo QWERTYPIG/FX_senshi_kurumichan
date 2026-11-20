@@ -8,5 +8,20 @@
   "seed": 42,
   "attention": true,
   "embedding": true,
-  "embedding_size": 4
+  "embedding_size": 4,
+  "evaluation": {
+    "folds": [
+      {"start": "2024-07-01", "end": "2024-09-30"},
+      {"start": "2024-10-01", "end": "2024-12-31"},
+      {"start": "2025-01-01", "end": "2025-03-31"},
+      {"start": "2025-04-01", "end": "2025-06-30"},
+      {"start": "2025-07-01", "end": "2025-09-30"},
+      {"start": "2025-10-01", "end": "2025-12-31"},
+      {"start": "2026-01-01", "end": "2026-03-31"},
+      {"start": "2026-04-01", "end": "2026-05-29"}
+    ],
+    "early_stopping_days": 60,
+    "patience": 2,
+    "final_test_start": "2026-06-01"
+  }
 }

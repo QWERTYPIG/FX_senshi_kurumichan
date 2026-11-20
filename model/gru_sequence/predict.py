@@ -3,15 +3,12 @@
 import csv
 import json
 import logging
-from datetime import timedelta
 
 import torch
 from global_history import GLOBAL_COLUMNS
-from market import MarketHistory
+from market import MAX_MARKET_AGE, MarketHistory
 from network import GRUSequence
 from runtime import Config, ManagerPaths, command_parser, configure_cpu, iso_date
-
-MAX_MARKET_AGE = timedelta(days=10)
 
 
 def read_template(path):
