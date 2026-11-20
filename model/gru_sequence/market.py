@@ -96,7 +96,8 @@ class MarketHistory:
         self.global_indices = [torch.tensor([self.calendar_positions[day] for day in days], dtype=torch.long)
                                for days, _ in self.series]
 
-    def batch(self, day: date, length: int, *, labels: bool = False) -> DateBatch:
+    def batch(self, day: date, length: int, *, labels: bool = False,
+              market_not_before: date | None = None) -> DateBatch:
         present = torch.zeros(len(self.stock_ids), dtype=torch.bool)
         market = torch.zeros(len(self.stock_ids), length, len(MARKET_COLUMNS), dtype=torch.float64)
         global_window = torch.zeros(len(self.stock_ids), length, len(GLOBAL_COLUMNS), dtype=torch.float64)
@@ -110,8 +111,10 @@ class MarketHistory:
         global_sources = []
         for i, (days, values) in enumerate(self.series):
             end = bisect_left(days, day)
-            latest.append(days[end - 1] if end else None)
-            if end < length or (labels and (end == len(days) or days[end] != day)):
+            last_row = days[end - 1] if end else None
+            latest.append(last_row)
+            stale = market_not_before is not None and (last_row is None or last_row < market_not_before)
+            if stale or end < length or (labels and (end == len(days) or days[end] != day)):
                 global_sources.append((None,) * len(GLOBAL_COLUMNS))
                 continue
             present[i] = True
