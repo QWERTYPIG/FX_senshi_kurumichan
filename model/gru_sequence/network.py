@@ -10,6 +10,7 @@ from torch import nn
 class GRUSequence(nn.Module):
     def __init__(self, config: Config, num_stocks: int):
         super().__init__()
+        self.input_noise_std = config.input_noise_std
         self.gru = nn.GRU(len(MARKET_COLUMNS) + len(GLOBAL_COLUMNS), config.hidden_size,
                           config.gru_layers, batch_first=True)
         self.attention = (
@@ -31,7 +32,14 @@ class GRUSequence(nn.Module):
         if positions.numel() == 0:
             return scores
 
-        _, states = self.gru(batch.sequence[positions])
+        sequence = batch.sequence[positions]
+        today = batch.today.expand(positions.numel(), -1)
+        if self.training and self.input_noise_std:
+            # Perturb only the model's inputs, not the cached batches. Today's
+            # US features are shared across the cross-section.
+            sequence = sequence + torch.randn_like(sequence) * self.input_noise_std
+            today = today + torch.randn_like(batch.today) * self.input_noise_std
+        _, states = self.gru(sequence)
         summary = states[-1]
         if self.attention is not None:
             cross_section = summary.unsqueeze(0)
@@ -40,7 +48,7 @@ class GRUSequence(nn.Module):
         parts = [summary]
         if self.embedding is not None:
             parts.append(self.embedding(positions))
-        parts.append(batch.today.expand(positions.numel(), -1))
+        parts.append(today)
         scores[positions] = self.head(torch.cat(parts, dim=-1)).squeeze(-1)
         return scores
 

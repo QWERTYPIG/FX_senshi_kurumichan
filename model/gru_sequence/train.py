@@ -1,14 +1,20 @@
 """Fit one fixed configuration on all available universe stock labels."""
 
 import json
-from dataclasses import asdict, replace
+import logging
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import torch
 from market import MarketHistory
 from network import GRUSequence
-from runtime import MODEL_DIR, Config, ManagerPaths, command_parser, configure_cpu, deployment_seeds, package_versions
+from runtime import (
+    CHECKPOINT_NAME, MODEL_DIR, Config, ManagerPaths, command_parser, configure_cpu, deployment_seeds, run_metadata,
+)
+
+
+BATCH_CACHE_BYTES = 256 * 1024**2
 
 
 class TrainingBatches:
@@ -18,7 +24,11 @@ class TrainingBatches:
         self.history = history
         self.length = config.window_length
         self.cached = {}
-        self.remaining_bytes = 256 * 1024**2
+        self.remaining_bytes = BATCH_CACHE_BYTES
+
+    @property
+    def num_stocks(self):
+        return len(self.history.stock_ids)
 
     def for_dates(self, dates):
         for day in dates:
@@ -53,37 +63,30 @@ def train_epoch(model, optimizer, batches):
         optimizer.step()
 
 
-def fit_fixed(config: Config, num_stocks: int, make_batches):
-    model, optimizer = initialize_training(config, num_stocks)
+def fit_fixed(config: Config, batches: TrainingBatches, dates):
+    model, optimizer = initialize_training(config, batches.num_stocks)
     for _ in range(config.epochs):
-        train_epoch(model, optimizer, make_batches())
+        train_epoch(model, optimizer, batches.for_dates(dates))
     return model
 
 
-def fit_ensemble(config, seeds, num_stocks, make_batches):
-    return [fit_fixed(replace(config, seed=seed), num_stocks, make_batches) for seed in seeds]
+def fit_ensemble(config, seeds, batches, dates):
+    return [fit_fixed(replace(config, seed=seed), batches, dates) for seed in seeds]
 
 
 def save_ensemble(directory, models, seeds, metadata):
     directory.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=directory, prefix=".fit-") as tmp:
         staging = Path(tmp)
-        if len(seeds) == 1:
-            torch.save(models[0].state_dict(), staging / "model.pt")
-            (staging / "model.pt").replace(directory / "model.pt")
-            files = ["model.pt"]
-        else:
-            # Keep weight sets immutable so readers with older metadata cannot mix runs.
-            name = "ensemble-" + staging.name.removeprefix(".fit-")
-            weights = staging / name
-            weights.mkdir()
-            for seed, model in zip(seeds, models):
-                torch.save(model.state_dict(), weights / f"model-{seed}.pt")
-            weights.rename(directory / name)
-            files = [f"{name}/model-{seed}.pt" for seed in seeds]
-        payload = {**metadata, "deployment_seeds": seeds, "model_files": files}
+        metadata = {**metadata, "deployment_seeds": seeds}
+        states = {seed: model.state_dict() for seed, model in zip(seeds, models, strict=True)}
+        checkpoint = staging / CHECKPOINT_NAME
+        torch.save({"metadata": metadata, "states": states}, checkpoint)
         manifest = staging / "metadata.json"
-        manifest.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        manifest.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        # One replace publishes a complete fit. A concurrent reader with the
+        # previous file already open keeps that snapshot, including its metadata.
+        checkpoint.replace(directory / CHECKPOINT_NAME)
         manifest.replace(directory / "metadata.json")
 
 
@@ -93,23 +96,32 @@ def main():
     args = parser.parse_args()
     settings = json.loads(args.config.read_text(encoding="utf-8"))
     config = Config.from_settings(settings)
-    seeds = deployment_seeds(settings, config)
+    provisional = args.config.resolve() == MODEL_DIR / "config.json"
+    seeds = deployment_seeds(settings, config, allow_standalone=not provisional)
+    if provisional:
+        logging.warning("Using provisional GRU defaults; walk-forward evidence for adoption is pending (#16)")
     configure_cpu()
     paths = ManagerPaths.read()
     history = MarketHistory(paths.history, paths.update)
     dates = sorted(history.labeled_dates(config.window_length))
     if not dates:
         raise ValueError("no training labels with a complete market window")
-    batches = TrainingBatches(history, config)
-    models = fit_ensemble(config, seeds, len(history.stock_ids), lambda: batches.for_dates(dates))
+    epoch_selection = settings.get("epoch_selection")
+    epoch_source = "fixed"
+    if epoch_selection is not None:
+        epoch_source = "validation" if config.epochs == epoch_selection["refit_epochs"] else "fixed_override"
     metadata = {
-        "config": asdict(config),
+        **run_metadata(config, history),
         "stock_ids": history.stock_ids,
+        "deployment_mode": settings.get("deployment_mode", "ensemble"),
+        "configuration_status": "provisional_default" if provisional else "supplied",
         "first_training_label_date": dates[0].isoformat(),
         "last_training_label_date": dates[-1].isoformat(),
-        "torch_version": torch.__version__,
-        "package_versions": package_versions(),
+        "epoch_source": epoch_source,
+        "epoch_selection": epoch_selection,
     }
+    batches = TrainingBatches(history, config)
+    models = fit_ensemble(config, seeds, batches, dates)
     save_ensemble(args.artifacts_dir, models, seeds, metadata)
 
 

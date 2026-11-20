@@ -9,9 +9,10 @@ from operator import itemgetter
 from pathlib import Path
 from statistics import median
 
-from evaluate import EvaluationPlan, evaluate_validation, write_report
-from runtime import MODEL_DIR, Config, ManagerPaths, read_seeds
+from evaluate import EvaluationPlan, evaluate_validation, refit_epoch_count, write_report
+from runtime import MODEL_DIR, SEARCH_SEED_COUNT, Config, ManagerPaths, deployment_seeds, read_seeds
 
+GRID_STAGE, ABLATION_STAGE = 1, 2
 GRID_FIELDS = ("window_length", "gru_layers", "hidden_size")
 FOLD_FIELDS = ("fold", "start", "end", "validation_dates", "row_count", "always_up", "always_down")
 
@@ -43,10 +44,12 @@ def run_trial(paths, plan, seeds, directory, trial_id, stage, config):
                                       "contest_score": fold["contest_score"]})
     for fold in folds.values():
         fold["contest_score"] = math.fsum(run["contest_score"] for run in fold["runs"]) / len(seeds)
+        fold["median_best_epoch"] = median(run["best_epoch"] for run in fold["runs"])
     trial = {"id": trial_id, "stage": stage, "config": asdict(config), "folds": list(folds.values()),
-             "mean_contest_score": math.fsum(fold["contest_score"] for fold in folds.values()) / len(folds)}
+             "mean_contest_score": math.fsum(fold["contest_score"] for fold in folds.values()) / len(folds),
+             "refit_epochs": refit_epoch_count(fold["median_best_epoch"] for fold in folds.values())}
     metadata = {key: metrics[key] for key in ("universe_stock_ids", "target_stock_ids", "data_date_range",
-                                               "package_versions")}
+                                               "global_data_date_range", "package_versions")}
     return trial, metadata
 
 
@@ -75,9 +78,10 @@ def main():
     parser.add_argument("--artifacts-dir", type=Path, required=True)
     args = parser.parse_args()
     settings = json.loads(args.config.read_text(encoding="utf-8"))
-    candidates = grid(settings["search"], Config.from_settings(settings))
-    seeds = read_seeds(settings["search"]["seeds"], 3, "search.seeds")
-    read_seeds(settings["deployment_seeds"], 5, "deployment_seeds")
+    base = Config.from_settings(settings)
+    candidates = grid(settings["search"], base)
+    seeds = read_seeds(settings["search"]["seeds"], SEARCH_SEED_COUNT, "search.seeds")
+    deployment_seeds(settings, base, allow_standalone=False)
     plan = EvaluationPlan.from_settings(settings["evaluation"])
     paths = ManagerPaths.read()
     directory = args.artifacts_dir
@@ -87,7 +91,7 @@ def main():
 
     trials = []
     for number, config in enumerate(candidates, start=1):
-        trial, metadata = run_trial(paths, plan, seeds, directory, f"grid-{number}", 1, config)
+        trial, metadata = run_trial(paths, plan, seeds, directory, f"grid-{number}", GRID_STAGE, config)
         trials.append(trial)
     rank = itemgetter("mean_contest_score")
     winner = max(trials, key=rank)
@@ -95,7 +99,7 @@ def main():
     eligible, ablations = [], []
     for switch in ("attention", "embedding"):
         config = replace(Config(**winner["config"]), **{switch: False})
-        trial, _ = run_trial(paths, plan, seeds, directory, f"no-{switch}", 2, config)
+        trial, _ = run_trial(paths, plan, seeds, directory, f"no-{switch}", ABLATION_STAGE, config)
         trials.append(trial)
         decision = compare_ablation(winner, trial, switch)
         ablations.append(decision)
@@ -104,8 +108,16 @@ def main():
     selected = max(eligible, key=rank) if eligible else winner
     for decision in ablations:
         decision["adopted"] = decision["trial"] == selected["id"]
-    epochs = max(1, math.floor(median(run["best_epoch"] for fold in selected["folds"] for run in fold["runs"])))
-    frozen = {**settings, **selected["config"], "epochs": epochs}
+    epoch_selection = {
+        "trial": selected["id"],
+        "refit_epochs": selected["refit_epochs"],
+        "folds": [
+            {**{key: fold[key] for key in ("fold", "start", "end", "median_best_epoch")},
+             "seed_best_epochs": [{"seed": run["seed"], "best_epoch": run["best_epoch"]} for run in fold["runs"]]}
+            for fold in selected["folds"]
+        ],
+    }
+    frozen = {**settings, **selected["config"], "epochs": selected["refit_epochs"], "epoch_selection": epoch_selection}
     report = {**metadata, "config": settings, "trials": trials, "stage_1_winner": winner["id"],
               "ablations": ablations, "selected_trial": selected["id"], "selected_config": frozen}
     for name, payload in (("search_metrics.json", report), ("selected_config.json", frozen)):

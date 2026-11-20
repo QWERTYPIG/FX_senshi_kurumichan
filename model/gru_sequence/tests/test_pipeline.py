@@ -60,8 +60,8 @@ class GRUSequencePipelineTests(unittest.TestCase):
         self.targets = ["2330", "0123"]
         self.config = {"window_length": 3, "hidden_size": 4, "gru_layers": 1,
                        "head_hidden_size": 4, "learning_rate": 0.01, "epochs": 2, "seed": 7,
-                       "attention": True, "embedding": True, "embedding_size": 4}
-        self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
+                       "attention": True, "embedding": True, "embedding_size": 4, "input_noise_std": 0.1}
+        self.write_config()
         for data_dir in (self.history, self.update):
             (data_dir / "market").mkdir(parents=True)
             (data_dir / "global").mkdir()
@@ -108,6 +108,11 @@ class GRUSequencePipelineTests(unittest.TestCase):
             capture_output=True, text=True, timeout=20, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
+
+    def write_config(self):
+        settings = {**self.config, "deployment_mode": "standalone"}
+        self.config_path.write_text(json.dumps(settings), encoding="utf-8")
 
     def train(self):
         self.run_command(1, "--config", str(self.config_path))
@@ -141,25 +146,26 @@ class GRUSequencePipelineTests(unittest.TestCase):
         self.predict(day)
         self.assertTrue(any(row["f"] != before[key]["f"] for key, row in self.details().items()))
 
-    def test_global_window_uses_each_trading_days_information_cutoff(self):
+    def test_global_window_uses_lagged_non_us_close_and_us_cutoff(self):
         day = "2026-05-26"
         self.train()
         self.predict(day)
         before = self.details()
 
-        # Non-US data dated on the final window day (May 25) misses that day's cutoff.
-        self.edit_global(self.update, "2026-05-25", **{"^TWII": 2000})
-        self.predict(day)
-        self.assertEqual(self.details(), before)
-
-        # Non-US data from May 22 is available on May 25, but never in the today vector.
-        self.edit_global(self.update, "2026-05-22", **{"^TWII": 2000})
-        self.predict(day)
-        self.assertTrue(any(row["f"] != before[key]["f"] for key, row in self.details().items()))
+        for column, value, source in (("^TWII", 2000, "latest_twii_date"),
+                                      ("^KS11", 1000, "latest_ks11_date"),
+                                      ("TX_OI", 3000, "latest_tx_oi_date")):
+            with self.subTest(column=column):
+                # May 25's close is available before predicting May 26.
+                self.edit_global(self.update, "2026-05-25", **{column: value})
+                self.predict(day)
+                after = self.details()
+                self.assertTrue(any(row["f"] != before[key]["f"] for key, row in after.items()))
+                self.assertEqual({row[source] for row in after.values()}, {"2026-05-25"})
+            self.edit_global(self.update, "2026-05-25", **{column: global_row(25)[GLOBAL_HEADER.index(column)]})
 
         # Move only the May 22 US observation to Saturday: this misses Friday's
         # cutoff but keeps the same values for Monday and for the today vector.
-        self.edit_global(self.update, "2026-05-22", **{"^TWII": global_row(22)[4]})
         self.edit_global(self.update, "2026-05-22", **{"^GSPC": ""})
         saturday = ["2026-05-23", "", "", global_row(22)[3], "", "", ""]
         path = self.global_file(self.update)
@@ -187,9 +193,9 @@ class GRUSequencePipelineTests(unittest.TestCase):
                 "latest_gspc_date": "2026-05-25",
                 "latest_ixic_date": "2026-05-22",
                 "latest_vix_date": "2026-05-25",
-                "latest_twii_date": "2026-05-22",
-                "latest_ks11_date": "2026-05-22",
-                "latest_tx_oi_date": "2026-05-22",
+                "latest_twii_date": "2026-05-25",
+                "latest_ks11_date": "2026-05-25",
+                "latest_tx_oi_date": "2026-05-25",
             })
 
         self.edit_global(self.update, "2026-05-25", **{"^IXIC": global_row(22)[2]})
@@ -246,7 +252,10 @@ class GRUSequencePipelineTests(unittest.TestCase):
         paths = [self.market_file(data_dir, stock) for data_dir in (self.history, self.update)
                  for stock in self.stocks]
         original = {path: path.read_bytes() for path in paths}
-        self.assertEqual(self.train()["last_training_label_date"], "2026-05-25")
+        metadata = self.train()
+        self.assertEqual(metadata["last_training_label_date"], "2026-05-25")
+        self.assertEqual(metadata["data_date_range"], ["2026-05-18", "2026-05-25"])
+        self.assertEqual(metadata["global_data_date_range"], ["2026-05-18", "2026-05-27"])
         self.assertEqual({path: path.read_bytes() for path in paths}, original)
 
         day = "2026-05-26"
@@ -279,10 +288,32 @@ class GRUSequencePipelineTests(unittest.TestCase):
         self.assertEqual(self.details(), expected)
 
         self.config["epochs"] = 1
-        self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
+        self.write_config()
         self.assertEqual(self.train()["config"], self.config)
         self.predict(date)
         self.assertNotEqual(self.details(), expected)
+
+    def test_default_input_noise_changes_training_but_inference_is_repeatable(self):
+        day = "2026-05-26"
+        self.config.pop("input_noise_std")
+        self.write_config()
+        self.train()
+        self.predict(day)
+        default = self.details()
+        self.predict(day)
+        self.assertEqual(self.details(), default)
+
+        self.config["input_noise_std"] = 0.1
+        self.write_config()
+        self.train()
+        self.predict(day)
+        self.assertEqual(self.details(), default)
+
+        self.config["input_noise_std"] = 0
+        self.write_config()
+        self.train()
+        self.predict(day)
+        self.assertTrue(any(row["f"] != default[key]["f"] for key, row in self.details().items()))
 
     def test_training_uses_intraday_return_not_y(self):
         date, last_label = "2026-05-26", "2026-05-25"
@@ -314,6 +345,19 @@ class GRUSequencePipelineTests(unittest.TestCase):
         self.predict(date)
         for key, row in self.details().items():
             self.assertLess(float(row["f"]), float(positive[key]["f"]))
+
+    def test_manager_defaults_train_five_seeds_and_warn_that_they_are_provisional(self):
+        for stock in self.stocks:
+            write_csv(self.market_file(self.history, stock), [MARKET_HEADER, *[
+                market_row(f"2026-05-{day:02d}") for day in range(1, 22)
+            ]])
+            write_csv(self.market_file(self.update, stock), [MARKET_HEADER])
+        result = self.run_command(1)
+        self.assertIn("provisional GRU defaults", result.stderr)
+        metadata = json.loads((self.artifacts / "metadata.json").read_text())
+        self.assertEqual(metadata["configuration_status"], "provisional_default")
+        self.assertEqual(len(set(metadata["deployment_seeds"])), 5)
+        self.assertEqual(self.predict("2026-05-25")[0], ["id", "2026-05-25"])
 
     def test_training_on_universe_writes_template_order_for_both_phases(self):
         metadata = self.train()

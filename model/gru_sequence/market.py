@@ -8,6 +8,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import torch
+from features import zscore_window_
 from global_history import GLOBAL_COLUMNS, US_COLUMNS, GlobalHistory
 from runtime import iso_date
 
@@ -64,7 +65,12 @@ class DateBatch:
     present: torch.Tensor
     latest_market_date: tuple[date | None, ...]
     latest_global_dates: tuple[tuple[date | None, ...], ...]
+    stale_market_positions: tuple[int, ...]
     intraday_return: torch.Tensor | None
+
+    @property
+    def all_market_stale(self):
+        return len(self.stale_market_positions) == len(self.latest_market_date)
 
 
 class MarketHistory:
@@ -89,21 +95,18 @@ class MarketHistory:
             self.returns.append(values[:, CLOSE] / values[:, OPEN] - 1)
             trading_dates.update(days)
         self.dates = tuple(sorted(trading_dates))
-        self.globals = GlobalHistory(history, update, through=before if before is not None else through)
-        global_rows = []
-        self.global_sources = []
-        previous = None
-        for day in self.dates:
-            values, sources = self.globals.at_cutoff(day, previous)
-            global_rows.append(values)
-            self.global_sources.append(sources)
-            previous = day
-        self.global_values = torch.tensor(global_rows, dtype=torch.float64).reshape(-1, len(GLOBAL_COLUMNS))
-        self.tx_observed = torch.tensor([sources[-1] is not None for sources in self.global_sources],
-                                        dtype=torch.bool)
+        self.globals = GlobalHistory(history, update, through=before if before is not None else through,
+                                     prediction_date=before)
+        self.global_values, self.global_sources, self.oi_available = self.globals.align(self.dates)
         self.calendar_positions = {day: i for i, day in enumerate(self.dates)}
         self.global_indices = [torch.tensor([self.calendar_positions[day] for day in days], dtype=torch.long)
                                for days, _ in self.series]
+
+    def stock_positions(self, ids, *, source):
+        positions = {stock: i for i, stock in enumerate(self.stock_ids)}
+        if not set(ids) <= positions.keys():
+            raise ValueError(f"{source} contains stock IDs outside the training universe")
+        return [positions[stock] for stock in ids]
 
     def labeled_dates(self, length: int) -> set[date]:
         return {day for days, _ in self.series for day in days[length:]}
@@ -117,24 +120,25 @@ class MarketHistory:
                 returns[i] = self.returns[i][end].item()
         return returns
 
-    def batch(self, day: date, length: int, *, labels: bool = False,
-              market_not_before: date | None = None) -> DateBatch:
+    def batch(self, day: date, length: int, *, labels: bool = False) -> DateBatch:
         present = torch.zeros(len(self.stock_ids), dtype=torch.bool)
         market = torch.zeros(len(self.stock_ids), length, len(MARKET_COLUMNS), dtype=torch.float64)
         global_window = torch.zeros(len(self.stock_ids), length, len(GLOBAL_COLUMNS), dtype=torch.float64)
-        tx_observed = torch.zeros(len(self.stock_ids), length, dtype=torch.bool)
+        oi_available = torch.zeros(len(self.stock_ids), length, dtype=torch.bool)
         intraday_return = torch.zeros(len(self.stock_ids), dtype=torch.float32) if labels else None
         # A requested prediction date need not already have its own market rows.
         end = bisect_left(self.dates, day)
         previous = self.dates[end - 1] if end else None
-        today, us_sources = self.globals.at_cutoff(day, previous, US_COLUMNS)
-        latest = []
-        global_sources = []
+        today, us_sources = self.globals.at_cutoff(day, previous)
+        latest, global_sources, stale_positions = [], [], []
+        market_not_before = day - MAX_MARKET_AGE if not labels else None
         for i, (days, values) in enumerate(self.series):
             end = bisect_left(days, day)
             last_row = days[end - 1] if end else None
             latest.append(last_row)
             stale = market_not_before is not None and (last_row is None or last_row < market_not_before)
+            if stale:
+                stale_positions.append(i)
             if stale or end < length or (labels and (end == len(days) or days[end] != day)):
                 global_sources.append((None,) * len(GLOBAL_COLUMNS))
                 continue
@@ -142,8 +146,8 @@ class MarketHistory:
             market[i] = values[end - length:end]
             positions = self.global_indices[i][end - length:end]
             global_window[i] = self.global_values[positions]
-            tx_observed[i] = self.tx_observed[positions]
-            # As-of source dates never decrease; today's US levels supersede
+            oi_available[i] = self.oi_available[positions]
+            # Source dates never decrease; today's US observations supersede
             # the window dates. Non-US inputs appear only in the window.
             window_sources = self.global_sources[self.calendar_positions[days[end - 1]]]
             global_sources.append((*us_sources, *window_sources[len(US_COLUMNS):]))
@@ -154,18 +158,9 @@ class MarketHistory:
         price = market[:, :, :len(PRICE_COLUMNS)]
         last_close = torch.where(present, market[:, -1, CLOSE], 1)
         price /= last_close[:, None, None]
-        other = market[:, :, len(PRICE_COLUMNS):]
-        std, mean = torch.std_mean(other, dim=1, correction=0, keepdim=True)
-        other -= mean
-        other /= torch.where(std > 0, std, 1)
-        # For TX_OI, leading gaps are neutral and do not enter the window statistics.
-        tx = global_window[:, :, -1]
-        count = tx_observed.sum(dim=1, keepdim=True).clamp_min(1)
-        tx -= tx.sum(dim=1, keepdim=True) / count
-        tx.masked_fill_(~tx_observed, 0)
-        std = (tx.square().sum(dim=1, keepdim=True) / count).sqrt()
-        tx /= torch.where(std > 0, std, 1)
+        zscore_window_(market[:, :, len(PRICE_COLUMNS):])
+        self.globals.normalize_window_(global_window, oi_available)
 
         sequence = torch.cat((market, global_window), dim=-1).float()
         return DateBatch(sequence, torch.tensor(today, dtype=torch.float32), present,
-                         tuple(latest), tuple(global_sources), intraday_return)
+                         tuple(latest), tuple(global_sources), tuple(stale_positions), intraday_return)

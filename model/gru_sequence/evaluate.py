@@ -4,15 +4,15 @@ import argparse
 import csv
 import json
 import math
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
 from statistics import median
 
 import torch
-from market import MAX_MARKET_AGE, MarketHistory, read_stock_ids
+from market import MarketHistory, read_stock_ids
 from network import mean_f
-from runtime import MODEL_DIR, Config, ManagerPaths, configure_cpu, deployment_seeds, iso_date, package_versions
+from runtime import MODEL_DIR, Config, ManagerPaths, configure_cpu, deployment_seeds, iso_date, run_metadata
 from train import TrainingBatches, fit_ensemble, fit_fixed, initialize_training, smooth_loss, train_epoch
 
 
@@ -28,9 +28,10 @@ class EvaluationPlan:
     early_stopping_days: int
     patience: int
     final_test_start: date
+    max_epochs: int = 5
 
     def __post_init__(self):
-        for field in ("early_stopping_days", "patience"):
+        for field in ("early_stopping_days", "patience", "max_epochs"):
             value = getattr(self, field)
             if type(value) is not int or value < 1:
                 raise ValueError(f"evaluation.{field} must be a positive integer")
@@ -84,25 +85,18 @@ def _early_loss(model, batches):
     return loss
 
 
-def _best_epoch(config, patience, num_stocks, batches, inner_fit_dates, early_labeled_dates):
-    model, optimizer = initialize_training(config, num_stocks)
+def _best_epoch(config, plan, batches, inner_fit_dates, early_labeled_dates):
+    model, optimizer = initialize_training(config, batches.num_stocks)
     best_loss = math.inf
     best_epoch = 0
-    for epoch in range(1, config.epochs + 1):
+    for epoch in range(1, plan.max_epochs + 1):
         train_epoch(model, optimizer, batches.for_dates(inner_fit_dates))
         loss = _early_loss(model, batches.for_dates(early_labeled_dates))
         if loss < best_loss:
             best_loss, best_epoch = loss, epoch
-        elif epoch - best_epoch >= patience:
+        elif epoch - best_epoch >= plan.patience:
             break
     return best_epoch
-
-
-def _target_positions(history, target_ids):
-    positions = {stock: i for i, stock in enumerate(history.stock_ids)}
-    if not set(target_ids) <= positions.keys():
-        raise ValueError("Top50@Y contains IDs outside Top100@Y")
-    return [positions[stock] for stock in target_ids]
 
 
 @torch.no_grad()
@@ -115,9 +109,8 @@ def _score(models, history, config, dates, target_positions):
         if not realized:
             continue
         # The prediction mask is causal: realized labels never decide which stocks enter attention.
-        not_before = day - MAX_MARKET_AGE
-        batch = history.batch(day, config.window_length, market_not_before=not_before)
-        if all(last is None or last < not_before for last in batch.latest_market_date):
+        batch = history.batch(day, config.window_length)
+        if batch.all_market_stale:
             raise ValueError(f"{day}: all universe stocks have stale market data")
         scores = mean_f(models, batch).tolist()
         for i, intraday_return in realized.items():
@@ -134,15 +127,18 @@ def _score(models, history, config, dates, target_positions):
             "always_up": always_up, "always_down": -always_up}, rows
 
 
+def refit_epoch_count(fold_epochs):
+    """Floor the median across folds; a fold can summarize several seed runs."""
+    return max(1, math.floor(median(fold_epochs)))
+
+
 def _dates(days):
     return [day.isoformat() for day in days]
 
 
 def _run_metadata(history, targets, config, final_test_start):
-    return {"config": asdict(config), "universe_stock_ids": history.stock_ids, "target_stock_ids": targets,
-            "data_date_range": _dates((history.dates[0], history.dates[-1])),
-            "final_test_start": final_test_start.isoformat(), "torch_version": torch.__version__,
-            "package_versions": package_versions()}
+    return {**run_metadata(config, history), "universe_stock_ids": history.stock_ids, "target_stock_ids": targets,
+            "final_test_start": final_test_start.isoformat()}
 
 
 def evaluate_validation(paths: ManagerPaths, config: Config, plan: EvaluationPlan):
@@ -150,40 +146,38 @@ def evaluate_validation(paths: ManagerPaths, config: Config, plan: EvaluationPla
     configure_cpu()
     history = MarketHistory(paths.history, paths.update, through=plan.folds[-1].end)
     targets = read_stock_ids(paths.history, "Top50@Y")
-    target_positions = _target_positions(history, targets)
+    target_positions = history.stock_positions(targets, source="Top50@Y in historical info.json")
     labeled = history.labeled_dates(config.window_length)
     splits = [_split_dates(history.dates, fold, plan.early_stopping_days, labeled) for fold in plan.folds]
     batches = TrainingBatches(history, config)
-    num_stocks = len(history.stock_ids)
     folds, predictions = [], []
     for number, (fold, dates) in enumerate(zip(plan.folds, splits), start=1):
-        epoch = _best_epoch(config, plan.patience, num_stocks, batches, dates.inner_fit, dates.usable_early_stopping)
-        model = fit_fixed(replace(config, epochs=epoch), num_stocks, lambda: batches.for_dates(dates.training))
+        epoch = _best_epoch(config, plan, batches, dates.inner_fit, dates.usable_early_stopping)
+        model = fit_fixed(replace(config, epochs=epoch), batches, dates.training)
         scores, rows = _score((model,), history, config, dates.validation, target_positions)
         folds.append({"fold": number, "start": fold.start.isoformat(), "end": fold.end.isoformat(),
                       "training_dates": _dates(dates.training), "inner_fit_dates": _dates(dates.inner_fit),
                       "early_stopping_dates": _dates(dates.early_stopping), "validation_dates": _dates(dates.validation),
                       "best_epoch": epoch, **scores})
         predictions.extend({"fold": number, **row} for row in rows)
-    refit_epochs = max(1, math.floor(median(fold["best_epoch"] for fold in folds)))
+    refit_epochs = refit_epoch_count(fold["best_epoch"] for fold in folds)
     metrics = _run_metadata(history, targets, config, plan.final_test_start)
     return {**metrics, "early_stopping_days": plan.early_stopping_days, "patience": plan.patience,
-            "folds": folds, "refit_epochs": refit_epochs}, predictions
+            "max_epochs": plan.max_epochs, "folds": folds, "refit_epochs": refit_epochs}, predictions
 
 
-def report_final_test(paths: ManagerPaths, config: Config, final_test_start: date, seeds=None):
+def report_final_test(paths: ManagerPaths, config: Config, final_test_start: date, seeds):
     """Fit the frozen seed ensemble before the final test period; then score mean f."""
-    seeds = (config.seed,) if seeds is None else seeds
     configure_cpu()
     pre_test = MarketHistory(paths.history, paths.update, through=final_test_start - timedelta(days=1))
     training_dates = sorted(pre_test.labeled_dates(config.window_length))
     if not training_dates:
         raise ValueError("no usable training labels before the final test period")
     targets = read_stock_ids(paths.history, "Top50@Y")
-    target_positions = _target_positions(pre_test, targets)
+    target_positions = pre_test.stock_positions(targets, source="Top50@Y in historical info.json")
     metadata = _run_metadata(pre_test, targets, config, final_test_start)
     batches = TrainingBatches(pre_test, config)
-    models = fit_ensemble(config, seeds, len(pre_test.stock_ids), lambda: batches.for_dates(training_dates))
+    models = fit_ensemble(config, seeds, batches, training_dates)
     del batches, pre_test
 
     history = MarketHistory(paths.history, paths.update)

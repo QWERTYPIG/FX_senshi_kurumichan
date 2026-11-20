@@ -4,13 +4,16 @@ import argparse
 import math
 import os
 import platform
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
 
 import torch
 
 MODEL_DIR = Path(__file__).resolve().parent
+CHECKPOINT_NAME = "checkpoint.pt"
+DEPLOYMENT_SEED_COUNT = 5
+SEARCH_SEED_COUNT = 3
 
 
 def iso_date(value: str) -> date:
@@ -32,6 +35,7 @@ class Config:
     attention: bool = True
     embedding: bool = True
     embedding_size: int = 4
+    input_noise_std: float = 0.1
 
     def __post_init__(self):
         for field in ("attention", "embedding"):
@@ -45,10 +49,13 @@ class Config:
         if (type(self.learning_rate) not in (int, float)
                 or not math.isfinite(self.learning_rate) or self.learning_rate <= 0):
             raise ValueError("learning_rate must be positive and finite")
+        if (type(self.input_noise_std) not in (int, float)
+                or not math.isfinite(self.input_noise_std) or self.input_noise_std < 0):
+            raise ValueError("input_noise_std must be nonnegative and finite")
 
     @classmethod
     def from_settings(cls, settings):
-        sections = {"evaluation", "search", "deployment_seeds"}
+        sections = {"evaluation", "search", "deployment_mode", "deployment_seeds", "epoch_selection"}
         return cls(**{key: value for key, value in settings.items() if key not in sections})
 
 
@@ -67,14 +74,24 @@ def read_seeds(values, count, field):
     return tuple(values)
 
 
-def deployment_seeds(settings, config):
-    if "deployment_seeds" not in settings:
-        return (config.seed,)  # Preserve single-seed configs for isolated runs.
-    return read_seeds(settings["deployment_seeds"], 5, "deployment_seeds")
+def deployment_seeds(settings, config, *, allow_standalone=True):
+    mode = settings.get("deployment_mode", "ensemble")
+    if mode == "standalone" and allow_standalone:
+        if "deployment_seeds" in settings:
+            raise ValueError("standalone uses seed, not deployment_seeds")
+        return (config.seed,)
+    if mode != "ensemble":
+        raise ValueError("deployment_mode must be ensemble" + (" or standalone" if allow_standalone else ""))
+    return read_seeds(settings.get("deployment_seeds"), DEPLOYMENT_SEED_COUNT, "deployment_seeds")
 
 
-def package_versions():
-    return {"python": platform.python_version(), "torch": torch.__version__}
+def run_metadata(config, history):
+    return {
+        "config": asdict(config),
+        "data_date_range": [history.dates[0].isoformat(), history.dates[-1].isoformat()],
+        "global_data_date_range": history.globals.source_date_range(),
+        "package_versions": {"python": platform.python_version(), "torch": str(torch.__version__)},
+    }
 
 
 @dataclass(frozen=True)
