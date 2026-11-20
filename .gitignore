@@ -9,4 +9,3 @@ data.zip
 **/__pycache__/
 model/*/prediction.csv
 .DS_Store
-.data/
