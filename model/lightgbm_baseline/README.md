@@ -13,6 +13,65 @@
 .venv/bin/python model/lightgbm_baseline/train.py
 ```
 
+## 參數搜尋
+
+保留目前 14 個特徵，透過相同 walk-forward 切分選擇參數，然後訓練選出的模型：
+
+```sh
+.venv/bin/python model/lightgbm_baseline/tune.py
+```
+
+預設 `parameter_grid.json` 有 12 組候選，包含原本的參數：
+
+| 參數 | 候選值 |
+| --- | --- |
+| `num_leaves` / `max_depth` | 7 / 4、15 / 5、31 / 6 |
+| `min_child_samples` | 50、200 |
+| `reg_lambda` | 1、10 |
+
+`learning_rate=0.03` 固定，最多 500 輪；各折仍在內層以 MSE 做 early stopping，
+外層用官方 score 評估。最終輪數取選中候選各折最佳輪數的中位數。
+
+每個候選只產生 validation 指標，不評估 test、也不訓練部署模型。排名先比較
+**各折平均 score（高者優先）**；相同時比較折間 score 標準差（低者優先），再比較
+合併 validation MSE（低者優先），最後依原候選順序。這個規則與 pooled score 在
+缺少股票日、各折筆數不相同時略有差異。搜尋期間會檢查資料與程式雜湊；若變動，
+停止且不替換部署模型，避免不同候選使用不同資料。
+
+選定後才用最佳參數重新訓練並評估一次最後的 test，再以全部允許日期訓練部署模型。
+成功後自動更新 `artifacts/model.txt` 等檔案；舊檔案備份在該次搜尋的 `previous_model/`。
+此操作只更新本機模型，不會透過 manager 提交比賽預測。
+
+產出位於 `artifacts/search/<run_id>/`：
+
+- `configuration.json`：搜尋網格、時間切分、特徵、資料與程式雜湊、排名規則。
+- `search_results.csv` / `.json`：所有候選依 validation 排名的結果。
+- `trial_XX/` 與 `.log`：每個候選的逐折結果和執行日誌；不含 test 指標。
+- `selected_model/`：選中的模型、CV/test 評估與參數。
+- `summary.json`：最佳候選與最後 test 結果。
+
+`artifacts/best_params.json` 保存所選超參數及搜尋來源。之後執行 `train.py` 或 manager
+的「重新訓練＋預測」會自動沿用這份參數，在最新資料上重新做 CV 選輪數和訓練；
+不會每次自動搜尋。想重新選參數時再執行 `tune.py`。
+
+可自行提供候選清單，也支援所有原有時間切分參數：
+
+```sh
+.venv/bin/python model/lightgbm_baseline/tune.py --grid /path/to/grid.json --cv-folds 5 --valid-days 20
+.venv/bin/python model/lightgbm_baseline/train.py --params /path/to/best_params.json
+.venv/bin/python model/lightgbm_baseline/train.py --baseline
+```
+
+候選檔是 JSON list，例如 `[{}, {"learning_rate": 0.05, "reg_lambda": 10}]`。
+空物件代表原本參數。也可調整 `n_estimators`、`num_leaves`、`max_depth`、
+`min_child_samples`、`reg_alpha`、`colsample_bytree`、`subsample` 與 `subsample_freq`。
+若清單不含原本參數，搜尋會補入；重複候選會合併。`--baseline` 明確忽略保存的最佳參數。
+若使用 `--params` 在另一個 `--artifacts-dir` 訓練，之後也應繼續明確指定該參數檔。
+
+**選出來的最佳 validation 成績帶有選擇偏差**，不能當作完全獨立的樣本外成績。
+最後 test 不參與搜尋，但這些歷史日期已在之前的實驗中查看過，仍需持續追蹤
+新日期的實際表現。想比較大量網格的泛化能力，應增加另一層時間驗證或預留新的測試期間。
+
 每次訓練都重新掃描 `basic_data/market/` 與 `data/market/` 的 CSV，使用兩者聯集
 中的全部股票。`model/all_down/all_down.csv`（可用 `--stock-template` 指定）只用來
 決定驗證與輸出的目標股票清單，不限制訓練股票。

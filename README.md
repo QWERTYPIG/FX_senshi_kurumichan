@@ -28,9 +28,10 @@ Manager 提供以下環境變數（都是絕對路徑）：
 | `MANAGER_ROOT` | repo 路徑 |
 | `MANAGER_DATA_DIR` | 每日更新的 `data/`，包含 2026-09-01 起的資料，含 `market/*.csv`、`global/global_data.csv` |
 | `MANAGER_BASIC_DATA_DIR` | `basic_data/`，包含 2020 年起至目前的歷史資料 |
+| `MANAGER_US_DATA_DIR` | `us_data/`，FinMind 美股日線，價格存於 `prices/*.csv` |
 | `MANAGER_TEMPLATE` | 本次參考模板，包含正確股票順序與日期 |
 
-訓練與預測指令都會收到這兩個資料目錄。模型可讀取 `os.environ["MANAGER_BASIC_DATA_DIR"]` 取得歷史資料，並以 `os.environ["MANAGER_DATA_DIR"]` 取得每日更新資料。兩者有重疊日期時，由模型合併並處理重複列。
+訓練與預測指令都會收到上述資料目錄。模型可讀取 `os.environ["MANAGER_BASIC_DATA_DIR"]` 取得歷史資料，並以 `os.environ["MANAGER_DATA_DIR"]` 取得每日更新資料。兩者有重疊日期時，由模型合併並處理重複列。
 
 預測結果寫入 current working directory 的 `prediction.csv`，也就是 `model/<model_name>/prediction.csv`，不是 stdout。Manager 驗證後會複製一份到 `manager_data/runs/<run_id>/prediction.csv` 封存，模型目錄保留最新產出的檔案；stdout 與 stderr 只收進執行 Log。若程式輸出 CSV 到 stdout，可寫 `python predict.py > prediction.csv`，並把其他日誌寫到 stderr。
 
@@ -50,6 +51,8 @@ Manager 提供以下環境變數（都是絕對路徑）：
 
 manager 可透過「重新訓練＋預測」使用此模型。每次訓練重新讀檔，預設涵蓋最新有效行情日期，無須調整固定截止日。預測日期必須晚於訓練截止日；Phase 1 歷史回測需另訓練截止日更早的模型。特徵、評估設計、產出檔案與參數詳見 [模型說明](model/lightgbm_baseline/README.md)。
 
+執行 `.venv/bin/python model/lightgbm_baseline/tune.py` 可在維持原有特徵的情況下比較 12 組參數，依 walk-forward validation 的平均 score 選出最佳組合並訓練模型。排名存於 `artifacts/search/<run_id>/search_results.csv`；成功後的 `artifacts/best_params.json` 會由後續 `train.py` 與 manager 重新訓練自動沿用。
+
 ## Logistic regression
 
 `model/logistic_regression/` 提供依報酬絕對值加權的 logistic regression，附上原專案訓練至
@@ -63,6 +66,61 @@ manager 可透過「重新訓練＋預測」使用此模型。每次訓練重新
 預設重訓保留 Phase 1 的時間切分，只使用 2026-05-31 以前的標籤；需要包含更近期資料時，
 請指定 `--train-end` 與 `--validation-start`。資料目錄必須包含完整歷史，僅有九月以後的更新資料
 無法執行預設重訓。特徵、資料需求、日期限制與參數詳見 [模型說明](model/logistic_regression/README.md)。
+
+## 美國日線資料（FinMind）
+
+透過 [FinMind 美股技術面 API](https://finmind.github.io/tutor/UnitedStatesMarket/Technical/) 的 `USStockPrice` 下載 **2022-01-01 至執行當日**的可用日線，存於 repo 根目錄的 `us_data/`。結束日期以紐約日期計算，實際最新交易日取決於 API 已公布的資料。使用既有 `requests` 與 `python-dotenv`，可在 `.env` 設定 `FINMIND_TOKEN=你的token` 以帶入 Bearer token。未設定時會嘗試公開額度，權限與配額以 API 回應為準。
+
+首次執行歷史下載：
+
+```sh
+.venv/bin/python script/download_us.py
+```
+
+下載範圍尚未另行指定時，預設為 20 個代碼：`^DJI ^GSPC ^IXIC ^SOX ^VIX SPY QQQ SMH AAPL MSFT NVDA AMD AVGO TSM ASML AMAT LRCX MU INTC QCOM`。可直接指定清單，或使用 `--all` 讀取 `USStockInfo` 的所有代碼：
+
+```sh
+.venv/bin/python script/download_us.py --symbols '^IXIC' '^GSPC' NVDA AMD TSM
+.venv/bin/python script/download_us.py --all
+```
+
+清單與起始日期保存於 `us_data/config.json`。後續更新腳本與 manager 都會沿用這份設定。全市場代碼很多，初次下載與每日更新會需要大量請求，請依自身額度選擇範圍。
+
+增量更新使用：
+
+```sh
+.venv/bin/python script/update_us.py
+```
+
+- 歷史資料依年份下載，每個成功區間立即保存。中斷後重新執行會依進度續傳。
+- 歷史下載完成後，每次更新會重抓最近 7 個日曆日，依日期合併、去重，API 新列覆蓋相同日期。可用 `--overlap-days` 調整範圍。需要回補更早的調整收盤價修訂時，使用 `--full` 重抓全部年份。
+- 每次請求預設至少相隔 13 秒。429 會保存等待期限，依 `Retry-After` 等待，缺少該欄位時等待一小時。再次執行會繼續進度。
+- `--max-requests 25` 可限制單次請求數。達到上限會保存游標，之後重跑接續；`--output-dir` 可指定其他輸出目錄。Manager 固定使用 repo 的 `us_data/`。
+- CSV 以原子替換保存，API 或欄位錯誤時保留之前成功下載的內容。`metadata.json` 記錄各代碼的列數、最新資料日期、下載進度與錯誤，輸出的 `pending` 代表仍有未完成的工作。
+
+檔案結構如下：
+
+```text
+us_data/
+  config.json
+  metadata.json
+  prices/
+    AAPL.csv
+    NVDA.csv
+    ^IXIC.csv
+```
+
+CSV 欄位為 `date,stock_id,Open,High,Low,Close,Adj_Close,Volume`，每個代碼一份檔案。原始價格與還原收盤價按 API 提供的值保存。模型可從 `MANAGER_US_DATA_DIR` 取得此目錄，再自行讀取需要的代碼。
+
+先完成一次歷史下載，再啟動或重啟 manager。當 `us_data/config.json` 存在時，manager 會在啟動同步、05:10、22:10，以及手動「同步資料與預測」時更新美股資料。另外每天 **08:10（台北時間）** 有一個美股更新排程，配合文件標示的 08:00 更新時間與本專案 08:30 提交排程。Manager 每次最多 25 個 API 請求，未完成或失敗時會再嘗試分批續傳。完整市場的大量資料可能無法在提交前更新完畢。
+
+美股 CSV 的內容雜湊會與比賽資料版本一起保存。美股有更新時，也會為所有模型重新產生預測；內容沒有改變時會略過成功且日期相符的模型。美股連線失敗會記錄於「執行動態」，比賽資料同步會繼續進行。
+
+可執行離線測試：
+
+```sh
+.venv/bin/python -m unittest discover -s tests -p 'test_finmind_us.py' -v
+```
 
 ## 同步、排程與計分
 
