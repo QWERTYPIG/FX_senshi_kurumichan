@@ -8,3 +8,4 @@ manager_data/
 data.zip
 **/__pycache__/
 model/*/prediction.csv
+us_data/

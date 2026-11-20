@@ -12,6 +12,37 @@ from features import (DATA_DIR, HISTORY_DIR, FEATURES, FEATURE_VERSION, MODEL_DI
                       build_dataset, discover_stock_ids, read_template)
 from validation import select_iterations, walk_forward_splits
 
+BASE_PARAMS = dict(
+    objective="regression", n_estimators=500, learning_rate=0.03,
+    num_leaves=7, max_depth=4, min_child_samples=50,
+    reg_lambda=1.0, random_state=42, n_jobs=4, verbosity=-1,
+    deterministic=True, force_col_wise=True,
+)
+TUNABLE_PARAMS = {
+    "n_estimators", "learning_rate", "num_leaves", "max_depth", "min_child_samples",
+    "reg_alpha", "reg_lambda", "colsample_bytree", "subsample", "subsample_freq",
+}
+
+
+def validate_overrides(overrides):
+    if not isinstance(overrides, dict) or overrides.keys() - TUNABLE_PARAMS:
+        raise ValueError(f"Parameter overrides must be an object using only {sorted(TUNABLE_PARAMS)}")
+    for name, value in overrides.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
+            raise ValueError(f"{name} must be a finite number")
+        if name in {"n_estimators", "num_leaves", "max_depth", "min_child_samples", "subsample_freq"}:
+            if not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+        if name in {"n_estimators", "learning_rate", "min_child_samples"} and value <= 0:
+            raise ValueError(f"{name} must be positive")
+        if name == "num_leaves" and value < 2:
+            raise ValueError("num_leaves must be at least 2")
+        if name in {"reg_alpha", "reg_lambda", "subsample_freq"} and value < 0:
+            raise ValueError(f"{name} must not be negative")
+        if name in {"colsample_bytree", "subsample"} and not 0 < value <= 1:
+            raise ValueError(f"{name} must be in (0, 1]")
+    return overrides
+
 
 def evaluate(frame, predicted_returns):
     actual_returns = frame["intraday_return"].to_numpy()
@@ -59,6 +90,10 @@ def main():
     parser.add_argument("--history-dir", type=Path, default=HISTORY_DIR)
     parser.add_argument("--stock-template", type=Path, default=ROOT / "model/all_down/all_down.csv")
     parser.add_argument("--artifacts-dir", type=Path, default=MODEL_DIR / "artifacts")
+    parameter_source = parser.add_mutually_exclusive_group()
+    parameter_source.add_argument("--params", type=Path, help="JSON parameter overrides or exported best_params.json")
+    parameter_source.add_argument("--baseline", action="store_true", help="Ignore saved tuning results and use original parameters")
+    parser.add_argument("--validation-only", action="store_true", help="Save CV results without evaluating test or fitting deployment model")
     parser.add_argument("--train-end", help="Last allowed label date, YYYY-MM-DD (inclusive)")
     parser.add_argument("--cv-folds", type=int, default=5)
     parser.add_argument("--valid-days", type=int, default=20, help="Trading dates in each outer validation fold")
@@ -66,6 +101,17 @@ def main():
     parser.add_argument("--early-stop-days", type=int, default=20, help="Inner tuning dates before each outer fold")
     parser.add_argument("--min-train-days", type=int, default=252, help="Minimum inner training dates in the first fold")
     args = parser.parse_args()
+    params_path = args.params
+    saved = args.artifacts_dir / "best_params.json"
+    if params_path is None and not args.baseline and saved.is_file():
+        params_path = saved
+    parameter_config = {}
+    if params_path is not None:
+        parameter_config = json.loads(params_path.read_text(encoding="utf-8"))
+        if not isinstance(parameter_config, dict):
+            parser.error("--params must contain a JSON object")
+    overrides = validate_overrides(parameter_config.get("params", parameter_config))
+    params = {**BASE_PARAMS, **overrides}
     prediction_stock_ids = read_template(args.stock_template)["id"].tolist()
     stock_ids = discover_stock_ids(args.data_dir, args.history_dir)
     if not set(prediction_stock_ids).issubset(stock_ids):
@@ -90,12 +136,6 @@ def main():
     print(f"Training {len(stock_ids)} stocks, evaluating/predicting {len(prediction_stock_ids)} stocks. "
           f"Loaded {len(frame)} rows from {frame['date'].min().date()} "
           f"through {frame['date'].max().date()} (latest available valid labels).")
-    params = dict(
-        objective="regression", n_estimators=500, learning_rate=0.03,
-        num_leaves=7, max_depth=4, min_child_samples=50,
-        reg_lambda=1.0, random_state=42, n_jobs=4, verbosity=-1,
-        deterministic=True, force_col_wise=True,
-    )
     folds, oof_frames, oof_returns = [], [], []
     for split in splits:
         inner_train = frame[frame["date"] <= split["inner_train_end"]]
@@ -133,9 +173,6 @@ def main():
               f"iterations={best}, score={result['validation']['score']:.6f}")
     selected_iterations = select_iterations([fold["best_iteration"] for fold in folds])
     params["n_estimators"] = selected_iterations
-    # Fit once on every pre-test row; final test never selects parameters or rounds.
-    model = lgb.LGBMRegressor(**params)
-    model.fit(train[FEATURES], train["intraday_return"], categorical_feature=["stock_id"])
     validation_frame = pd.concat(oof_frames, ignore_index=True)
     validation_returns = np.concatenate(oof_returns)
     fold_summary = {
@@ -158,8 +195,23 @@ def main():
             "positive_score_folds": sum(fold["validation"]["score"] > 0 for fold in folds),
         },
         "validation": evaluate(validation_frame, validation_returns),
-        "test": evaluate(test, model.predict(test[FEATURES])),
+        "search_params": {**BASE_PARAMS, **overrides},
+        "parameter_source": str(params_path.resolve()) if params_path else "baseline",
     }
+    args.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    pd.concat([prediction_rows(f, p, split["fold"])
+               for f, p, split in zip(oof_frames, oof_returns, splits)], ignore_index=True).to_csv(
+                   args.artifacts_dir / "validation_predictions.csv", index=False)
+    pd.json_normalize(folds).to_csv(args.artifacts_dir / "fold_metrics.csv", index=False)
+    if args.validation_only:
+        (args.artifacts_dir / "metrics.json").write_text(
+            json.dumps(metrics, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+        print(json.dumps(metrics, indent=2, ensure_ascii=False))
+        return
+    # Only evaluate test after the parameters have been fixed.
+    model = lgb.LGBMRegressor(**params)
+    model.fit(train[FEATURES], train["intraday_return"], categorical_feature=["stock_id"])
+    metrics["test"] = evaluate(test, model.predict(test[FEATURES]))
     # Freeze iteration count, then refit on ALL allowed dates for future inference.
     # The saved model's full-history outputs must not be used to report test scores.
     final = lgb.LGBMRegressor(**params)
@@ -178,6 +230,8 @@ def main():
                          "overlap_policy": "live row replaces historical row"},
         "threshold": 0, "params": params,
         "validation_method": "expanding_window", "cv_folds": args.cv_folds,
+        "parameter_source": metrics["parameter_source"],
+        "parameter_selection": parameter_config.get("selection"),
         "versions": {name: importlib.metadata.version(name)
                      for name in ("numpy", "pandas", "lightgbm", "scikit-learn")},
     }
@@ -187,10 +241,6 @@ def main():
     pd.DataFrame({"feature": FEATURES, "gain": final.booster_.feature_importance("gain")}).sort_values(
         "gain", ascending=False).to_csv(args.artifacts_dir / "feature_importance.csv", index=False)
     prediction_rows(test, model.predict(test[FEATURES])).to_csv(args.artifacts_dir / "test_predictions.csv", index=False)
-    pd.concat([prediction_rows(f, p, split["fold"])
-               for f, p, split in zip(oof_frames, oof_returns, splits)], ignore_index=True).to_csv(
-                   args.artifacts_dir / "validation_predictions.csv", index=False)
-    pd.json_normalize(folds).to_csv(args.artifacts_dir / "fold_metrics.csv", index=False)
     print(json.dumps(metrics, indent=2, ensure_ascii=False))
     print(f"Saved deployment model trained through {metadata['trained_through']} to {args.artifacts_dir}")
 

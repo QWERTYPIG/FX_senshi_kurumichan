@@ -121,6 +121,7 @@ class Manager:
             'submissions': [], 'lastCheck': None, 'lastStateCheck': None,
         }
         self.state.setdefault('submissionBatches', {})
+        self.state.setdefault('competitionDataHash', self.state['dataHash'])
         # Interrupted runs must be retried instead of remaining permanently 'running'.
         for record in self.state['runs']:
             if record['status'] == 'running':
@@ -229,13 +230,69 @@ class Manager:
         archive = self.store / 'data.zip'
         download_data(archive)
         digest = unpack(archive, self.root / 'data')
+        self.sync_us_prices()
+        changed = self.update_data_version(digest)
         with self.lock:
-            changed = digest != self.state['dataHash']
-            self.state.update(dataHash=digest, lastCheck=now())
+            self.state['lastCheck'] = now()
             if changed:
                 self.state['dataUpdatedAt'] = now()
             self.save()
         self.rescore()
+        self.predict_models(changed)
+        self.event('資料已更新' if changed else '資料內容未變更')
+
+    def sync_us_prices(self):
+        from finmind_us import sync_data
+        directory = self.root / 'us_data'
+        if not (directory / 'config.json').exists():
+            return
+        try:
+            result = sync_data(directory, max_requests=25)
+            with self.lock:
+                self.state['usDataStatus'] = {**result, 'checkedAt': now()}
+                if not result['pending']:
+                    slot = datetime.now(TAIPEI).replace(hour=8, minute=10, second=0, microsecond=0)
+                    if datetime.now(TAIPEI) >= slot:
+                        self.state['lastUSSlot'] = slot.isoformat()
+                self.save()
+            self.event('美股資料分批更新中，稍後續傳' if result['pending'] else '美股資料同步完成')
+            for symbol, error in result['errors'].items():
+                self.event(f'美股 {symbol} 更新失敗：{error}')
+        except Exception as exc:
+            with self.lock:
+                self.state['usDataStatus'] = {'error': str(exc), 'pending': True, 'checkedAt': now()}
+                self.save()
+            self.event(f'美股資料更新失敗：{exc}')
+
+    def update_data_version(self, competition_hash=None):
+        from finmind_us import data_hash
+        with self.lock:
+            if competition_hash is not None:
+                self.state['competitionDataHash'] = competition_hash
+            base = self.state['competitionDataHash']
+            directory = self.root / 'us_data'
+            us_hash = data_hash(directory) if (directory / 'config.json').exists() else None
+            digest = base
+            if base is not None and us_hash is not None:
+                digest = hashlib.sha256(f'{base}\0{us_hash}'.encode()).hexdigest()
+            changed = digest != self.state['dataHash']
+            self.state.update(dataHash=digest, usDataHash=us_hash)
+            self.save()
+            return changed
+
+    def refresh_us(self):
+        try:
+            self.fetch_state()
+        except Exception as exc:
+            self.event(f'比賽資訊更新失敗：{exc}')
+        self.sync_us_prices()
+        changed = self.update_data_version()
+        if changed:
+            self.predict_models(changed=True)
+        self.event('美股資料版本已更新' if changed else '美股資料內容未變更')
+
+    def predict_models(self, changed=False):
+        digest = self.state['dataHash']
         for name in self.discover():
             status = self.state['models'].get(name, {})
             # Also retry models that failed on an otherwise unchanged data revision.
@@ -247,7 +304,6 @@ class Manager:
                     self.run_model(name)
                 except Exception as exc:
                     self.event(f'{name} 執行失敗：{exc}')
-        self.event('資料已更新' if changed else '資料內容未變更')
 
     def template(self):
         from submit import parse_csv
@@ -300,6 +356,7 @@ class Manager:
             env = os.environ.copy()
             env.update(MANAGER_ROOT=str(self.root), MANAGER_DATA_DIR=str(self.root / 'data'),
                        MANAGER_BASIC_DATA_DIR=str(self.root / 'basic_data'),
+                       MANAGER_US_DATA_DIR=str(self.root / 'us_data'),
                        MANAGER_OUTPUT=str(output), MANAGER_TEMPLATE=str(self.template()))
             env['PATH'] = str(Path(sys.executable).parent) + os.pathsep + env.get('PATH', '')
             if train:
@@ -352,7 +409,7 @@ class Manager:
 
     def queue_submission_prediction(self, model):
         with self.lock:
-            if 'refresh:' in self.pending or f'train:{model}' in self.pending:
+            if 'refresh:' in self.pending or 'us-update:' in self.pending or f'train:{model}' in self.pending:
                 return '資料同步或訓練正在處理，稍後再檢查預測'
             if self.enqueue('predict', model):
                 return '已排入重新預測，完成後由排程重試'
@@ -562,6 +619,8 @@ class Manager:
             try:
                 if action == 'refresh':
                     self.refresh()
+                elif action == 'us-update':
+                    self.refresh_us()
                 elif action == 'state':
                     self.fetch_state()
                 elif action in {'train', 'predict'}:
@@ -587,6 +646,15 @@ class Manager:
         next_state = time.monotonic() + self.state_interval
         while not self.stop.wait(15):
             current = datetime.now(TAIPEI)
+            us_slot = current.replace(hour=8, minute=10, second=0, microsecond=0)
+            if ((self.root / 'us_data' / 'config.json').exists()
+                    and current >= us_slot and self.state.get('lastUSSlot') != us_slot.isoformat()
+                    and time.monotonic() >= getattr(self, '_next_us_retry', 0)):
+                try:
+                    if self.enqueue('us-update'):
+                        self._next_us_retry = time.monotonic() + 600
+                except queue.Full:
+                    self.event('美股更新佇列已滿，稍後重試')
             try:
                 self.queue_scheduled_submission(current)
             except queue.Full:
