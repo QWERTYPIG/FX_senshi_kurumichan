@@ -29,9 +29,15 @@ class Config:
     learning_rate: float
     epochs: int
     seed: int
+    attention: bool = True
+    embedding: bool = True
+    embedding_size: int = 4
 
     def __post_init__(self):
-        for field in ("window_length", "hidden_size", "gru_layers", "head_hidden_size", "epochs"):
+        for field in ("attention", "embedding"):
+            if type(getattr(self, field)) is not bool:
+                raise ValueError(f"{field} must be a boolean")
+        for field in ("window_length", "hidden_size", "gru_layers", "head_hidden_size", "epochs", "embedding_size"):
             value = getattr(self, field)
             if type(value) is not int or value < 1:
                 raise ValueError(f"{field} must be a positive integer")

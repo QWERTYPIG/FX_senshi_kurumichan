@@ -59,7 +59,8 @@ class GRUSequencePipelineTests(unittest.TestCase):
         self.stocks = ["0123", "1101", "2330"]
         self.targets = ["2330", "0123"]
         self.config = {"window_length": 3, "hidden_size": 4, "gru_layers": 1,
-                       "head_hidden_size": 4, "learning_rate": 0.01, "epochs": 2, "seed": 7}
+                       "head_hidden_size": 4, "learning_rate": 0.01, "epochs": 2, "seed": 7,
+                       "attention": True, "embedding": True, "embedding_size": 4}
         self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
         for data_dir in (self.history, self.update):
             (data_dir / "market").mkdir(parents=True)
