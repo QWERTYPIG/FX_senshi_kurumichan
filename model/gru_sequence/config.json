@@ -9,6 +9,13 @@
   "attention": true,
   "embedding": true,
   "embedding_size": 4,
+  "search": {
+    "window_length": [20, 60, 120],
+    "gru_layers": [1, 2],
+    "hidden_size": [32, 64],
+    "seeds": [42, 43, 44]
+  },
+  "deployment_seeds": [42, 43, 44, 45, 46],
   "evaluation": {
     "folds": [
       {"start": "2024-07-01", "end": "2024-09-30"},

@@ -43,3 +43,8 @@ class GRUSequence(nn.Module):
         parts.append(batch.today.expand(positions.numel(), -1))
         scores[positions] = self.head(torch.cat(parts, dim=-1)).squeeze(-1)
         return scores
+
+
+def mean_f(models, batch):
+    """Average raw scores; callers apply the direction threshold to this result."""
+    return torch.stack([model(batch) for model in models]).mean(dim=0, dtype=torch.float64)

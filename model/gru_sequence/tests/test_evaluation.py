@@ -32,6 +32,8 @@ class GRUEvaluationTests(unittest.TestCase):
             },
         }
         self.config.write_text(json.dumps(self.settings), encoding="utf-8")
+        self.template = self.root / "template.csv"
+        self.output = self.root / "prediction.csv"
         (self.history / "market").mkdir(parents=True)
         (self.history / "global").mkdir()
         (self.history / "info.json").write_text(json.dumps({"Top100@Y": self.stocks, "Top50@Y": self.targets}),
@@ -55,12 +57,13 @@ class GRUEvaluationTests(unittest.TestCase):
         return self.run_cli("evaluate.py", mode, artifacts=artifacts)
 
     def run_cli(self, *command, artifacts=None):
+        config_args = [] if command[0] == "predict.py" else ["--config", str(self.config)]
         return subprocess.run(
-            [sys.executable, *command, "--config", str(self.config), "--artifacts-dir", str(artifacts or self.artifacts)],
+            [sys.executable, *command, *config_args, "--artifacts-dir", str(artifacts or self.artifacts)],
             cwd=MODEL_DIR, env={**os.environ, "MANAGER_ROOT": str(self.root),
                                 "MANAGER_BASIC_DATA_DIR": str(self.history),
                                 "MANAGER_DATA_DIR": str(self.root / "update"),
-                                "MANAGER_TEMPLATE": str(self.root / "unused.csv")},
+                                "MANAGER_TEMPLATE": str(self.template), "MANAGER_OUTPUT": str(self.output)},
             capture_output=True, text=True, timeout=20, check=False,
         )
 
@@ -147,6 +150,31 @@ class GRUEvaluationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual({path: path.read_bytes() for path in selection}, selection)
 
+    def test_final_test_reports_the_frozen_ensemble_not_mean_seed_scores(self):
+        seeds = [7, 8, 9, 10, 11]
+        self.settings["deployment_seeds"] = seeds
+        self.config.write_text(json.dumps(self.settings), encoding="utf-8")
+        result = self.run_evaluation("final-test")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        metrics = self.metrics("final_test")
+        ensemble = self.predictions("final_test")
+        self.assertEqual(metrics["deployment_seeds"], seeds)
+        self.assertEqual(metrics["training_dates"], self.days[3:])
+        self.assert_scores(metrics, ensemble, self.test_days, {"2330": 0.02, "0123": -0.01})
+
+        self.settings.pop("deployment_seeds")
+        runs = []
+        for seed in seeds:
+            self.settings["seed"] = seed
+            self.config.write_text(json.dumps(self.settings), encoding="utf-8")
+            self.artifacts = self.root / f"final-{seed}"
+            result = self.run_evaluation("final-test")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            runs.append({(row["date"], row["id"]): float(row["f"]) for row in self.predictions("final_test")})
+        for row in ensemble:
+            scores = [run[row["date"], row["id"]] for run in runs]
+            self.assertAlmostEqual(float(row["f"]), sum(scores) / 5, places=7)
+
     def test_outer_validation_labels_do_not_pick_epochs(self):
         result = self.run_evaluation("validate")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -183,6 +211,129 @@ class GRUEvaluationTests(unittest.TestCase):
         self.assertEqual(last["row_count"], 3)
         self.assertAlmostEqual(last["always_up"], 0.01)
         self.assertAlmostEqual(last["always_down"], -0.01)
+
+    def test_search_pairs_ablations_and_freezes_validation_only_selection(self):
+        self.settings["search"] = {"window_length": [2, 3], "gru_layers": [1], "hidden_size": [4],
+                                   "seeds": [7, 8, 9]}
+        self.settings["deployment_seeds"] = [7, 8, 9, 10, 11]
+        self.config.write_text(json.dumps(self.settings), encoding="utf-8")
+        result = self.run_cli("search.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = self.metrics("search")
+        trials = {trial["id"]: trial for trial in report["trials"]}
+        grid = [trial for trial in trials.values() if trial["stage"] == 1]
+        self.assertCountEqual([trial["config"]["window_length"] for trial in grid], [2, 3])
+        self.assertTrue(all(trial["config"]["attention"] and trial["config"]["embedding"] for trial in grid))
+        self.assertEqual(len(trials), 4)
+        winner = trials[report["stage_1_winner"]]
+        self.assertEqual(winner["mean_contest_score"], max(t["mean_contest_score"] for t in grid))
+        for trial in trials.values():
+            self.assertEqual([fold["fold"] for fold in trial["folds"]], [1, 2])
+            for fold in trial["folds"]:
+                self.assertEqual([run["seed"] for run in fold["runs"]], [7, 8, 9])
+                self.assertAlmostEqual(fold["contest_score"], sum(run["contest_score"] for run in fold["runs"]) / 3)
+                self.assertAlmostEqual(fold["always_down"], -0.005)
+            self.assertAlmostEqual(trial["mean_contest_score"], sum(f["contest_score"] for f in trial["folds"]) / 2)
+            for seed in self.settings["search"]["seeds"]:
+                path = self.artifacts / trial["id"] / str(seed) / "validation_predictions.csv"
+                with path.open(newline="", encoding="utf-8") as handle:
+                    rows = list(csv.DictReader(handle))
+                self.assertCountEqual([(row["date"], row["id"]) for row in rows],
+                                      [(day, stock) for day in self.days[6:] for stock in self.targets])
+                for fold in trial["folds"]:
+                    signs = [float(row["intraday_return"]) * (2 * int(row["direction"]) - 1)
+                             for row in rows if row["fold"] == str(fold["fold"])]
+                    run = next(run for run in fold["runs"] if run["seed"] == seed)
+                    self.assertAlmostEqual(run["contest_score"], sum(signs) / len(signs))
+        eligible = []
+        self.assertCountEqual([ablation["switch"] for ablation in report["ablations"]], ["attention", "embedding"])
+        for ablation in report["ablations"]:
+            trial = trials[ablation["trial"]]
+            self.assertEqual(ablation["baseline"], winner["id"])
+            self.assertEqual(trial["config"], {**winner["config"], ablation["switch"]: False})
+            improvements = sum(a["contest_score"] > b["contest_score"] for a, b in zip(trial["folds"], winner["folds"]))
+            qualifies = improvements == 2 and trial["mean_contest_score"] > winner["mean_contest_score"]
+            self.assertEqual(ablation["improved_fold_count"], improvements)
+            self.assertEqual(ablation["gate_eligible"], qualifies)
+            self.assertEqual(ablation["adopted"], trial["id"] == report["selected_trial"])
+            if qualifies:
+                eligible.append(trial)
+        selected = max(eligible or [winner], key=lambda trial: trial["mean_contest_score"])
+        self.assertEqual(report["selected_trial"], selected["id"])
+        frozen = json.loads((self.artifacts / "selected_config.json").read_text())
+        self.assertEqual(frozen["deployment_seeds"], [7, 8, 9, 10, 11])
+        epochs = sorted(run["best_epoch"] for fold in selected["folds"] for run in fold["runs"])
+        self.assertEqual(frozen["epochs"], (epochs[2] + epochs[3]) // 2)
+        self.assertEqual(report["universe_stock_ids"], self.stocks)
+        self.assertEqual(report["target_stock_ids"], self.targets)
+        self.assertEqual(report["data_date_range"], [self.days[0], self.days[-1]])
+        self.assertIn("torch", report["package_versions"])
+
+        snapshot = {path.relative_to(self.artifacts): path.read_bytes()
+                    for path in self.artifacts.rglob("*") if path.is_file()}
+        self.assertFalse(any("final_test" in str(path) for path in snapshot))
+        self.write_prices({"0123": 95, "1101": 70, "2330": 104})
+        replay = self.root / "replay"
+        result = self.run_cli("search.py", artifacts=replay)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(snapshot, {path.relative_to(replay): path.read_bytes()
+                                    for path in replay.rglob("*") if path.is_file()})
+
+    def test_search_adopts_only_the_higher_scoring_variant_when_both_qualify(self):
+        self.settings["search"] = {"window_length": [2], "gru_layers": [1], "hidden_size": [4],
+                                   "seeds": [1, 17, 38]}
+        self.settings["deployment_seeds"] = [7, 8, 9, 10, 11]
+        self.config.write_text(json.dumps(self.settings), encoding="utf-8")
+        result = self.run_cli("search.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = self.metrics("search")
+        self.assertEqual([(a["switch"], a["gate_eligible"], a["adopted"]) for a in report["ablations"]],
+                         [("attention", True, False), ("embedding", True, True)])
+        self.assertEqual(report["selected_trial"], "no-embedding")
+        self.assertTrue(report["selected_config"]["attention"])
+        self.assertFalse(report["selected_config"]["embedding"])
+
+    def test_weekly_restores_five_seed_models_and_averages_f_before_sign(self):
+        seeds = [7, 8, 9, 10, 11]
+        self.settings.update(deployment_seeds=seeds, search={"not_a_valid_search_grid": True})
+        self.settings["evaluation"]["folds"] = []
+        self.config.write_text(json.dumps(self.settings), encoding="utf-8")
+        write_csv(self.template, [["id", "2026-06-03"], *[[stock, ""] for stock in self.targets]])
+        result = self.run_cli("train.py")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        metadata = json.loads((self.artifacts / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["deployment_seeds"], seeds)
+        self.assertEqual(len(set(metadata["model_files"])), 5)
+        self.assertTrue(all((self.artifacts / name).is_file() for name in metadata["model_files"]))
+        self.assertEqual(metadata["config"]["epochs"], 2)
+        self.assertEqual(metadata["stock_ids"], self.stocks)
+        self.assertEqual(metadata["first_training_label_date"], self.days[3])
+        self.assertEqual(metadata["last_training_label_date"], self.test_days[-1])
+        self.assertIn("torch", metadata["package_versions"])
+        self.assertEqual(list(self.artifacts.rglob("search_metrics.json")), [])
+
+        def predict(artifacts):
+            result = self.run_cli("predict.py", artifacts=artifacts)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            _, *rows = read_csv(self.output.with_name("prediction_detail.csv"))
+            return {row[0]: float(row[2]) for row in rows}
+
+        actual = predict(self.artifacts)
+        _, *directions = read_csv(self.output)
+        self.settings.pop("deployment_seeds")
+        single_scores = []
+        for seed in seeds:
+            self.settings["seed"] = seed
+            self.config.write_text(json.dumps(self.settings), encoding="utf-8")
+            artifacts = self.root / f"weekly-{seed}"
+            result = self.run_cli("train.py", artifacts=artifacts)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            single_scores.append(predict(artifacts))
+        self.assertGreater(len({scores[self.targets[0]] for scores in single_scores}), 1)
+        for stock, direction in directions:
+            expected = sum(scores[stock] for scores in single_scores) / 5
+            self.assertAlmostEqual(actual[stock], expected, places=7)
+            self.assertEqual(direction, str(int(expected > 0)))
 
     def test_weekly_fit_ignores_evaluation_settings_and_uses_latest_label(self):
         self.settings["evaluation"]["folds"] = []

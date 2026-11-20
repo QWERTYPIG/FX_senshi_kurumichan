@@ -7,7 +7,7 @@ import logging
 import torch
 from global_history import GLOBAL_COLUMNS
 from market import MAX_MARKET_AGE, MarketHistory
-from network import GRUSequence
+from network import GRUSequence, mean_f
 from runtime import Config, ManagerPaths, command_parser, configure_cpu, iso_date
 
 
@@ -46,9 +46,11 @@ def main():
         raise ValueError("template contains stock IDs outside the training universe")
     index = [positions[stock] for stock in target_ids]
 
-    model = GRUSequence(config, len(history.stock_ids))
-    model.load_state_dict(torch.load(args.artifacts_dir / "model.pt", map_location="cpu", weights_only=True))
-    model.eval()
+    models = []
+    for filename in metadata.get("model_files", ["model.pt"]):
+        model = GRUSequence(config, len(history.stock_ids))
+        model.load_state_dict(torch.load(args.artifacts_dir / filename, map_location="cpu", weights_only=True))
+        models.append(model.eval())
 
     columns = []
     details = []
@@ -62,7 +64,7 @@ def main():
         for stock, last_row in stale_stocks:
             logging.warning("%s: stale market data for stock %s (latest valid row: %s); treating as absent",
                             day, stock, last_row or "none")
-        scores = model(batch)
+        scores = mean_f(models, batch)
         directions = ((scores > 0) & batch.present).int()
         columns.append(directions[index].tolist())
         for stock, i in zip(target_ids, index):
