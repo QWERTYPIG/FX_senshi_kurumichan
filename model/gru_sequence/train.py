@@ -96,10 +96,8 @@ def main():
     args = parser.parse_args()
     settings = json.loads(args.config.read_text(encoding="utf-8"))
     config = Config.from_settings(settings)
-    provisional = args.config.resolve() == MODEL_DIR / "config.json"
-    seeds = deployment_seeds(settings, config, allow_standalone=not provisional)
-    if provisional:
-        logging.warning("Using provisional GRU defaults; walk-forward evidence for adoption is pending (#16)")
+    uses_default = args.config.resolve() == MODEL_DIR / "config.json"
+    seeds = deployment_seeds(settings, config, allow_standalone=not uses_default)
     configure_cpu()
     paths = ManagerPaths.read()
     history = MarketHistory(paths.history, paths.update)
@@ -110,11 +108,16 @@ def main():
     epoch_source = "fixed"
     if epoch_selection is not None:
         epoch_source = "validation" if config.epochs == epoch_selection["refit_epochs"] else "fixed_override"
+    configuration_status = "supplied"
+    if uses_default:
+        configuration_status = "selected_default" if epoch_source == "validation" else "provisional_default"
+        if configuration_status == "provisional_default":
+            logging.warning("Using provisional GRU defaults; config does not use a frozen epoch count")
     metadata = {
         **run_metadata(config, history),
         "stock_ids": history.stock_ids,
         "deployment_mode": settings.get("deployment_mode", "ensemble"),
-        "configuration_status": "provisional_default" if provisional else "supplied",
+        "configuration_status": configuration_status,
         "first_training_label_date": dates[0].isoformat(),
         "last_training_label_date": dates[-1].isoformat(),
         "epoch_source": epoch_source,

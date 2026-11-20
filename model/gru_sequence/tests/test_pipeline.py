@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 
 MODEL_DIR = Path(__file__).resolve().parents[1]
@@ -346,18 +347,25 @@ class GRUSequencePipelineTests(unittest.TestCase):
         for key, row in self.details().items():
             self.assertLess(float(row["f"]), float(positive[key]["f"]))
 
-    def test_manager_defaults_train_five_seeds_and_warn_that_they_are_provisional(self):
+    def test_manager_defaults_train_five_seeds_with_the_frozen_selection(self):
+        frozen = json.loads((MODEL_DIR / "config.json").read_text(encoding="utf-8"))
+        start = date(2026, 3, 1)
+        days = frozen["window_length"] + 1
+        rows = [market_row((start + timedelta(days=offset)).isoformat()) for offset in range(days)]
         for stock in self.stocks:
-            write_csv(self.market_file(self.history, stock), [MARKET_HEADER, *[
-                market_row(f"2026-05-{day:02d}") for day in range(1, 22)
-            ]])
+            write_csv(self.market_file(self.history, stock), [MARKET_HEADER, *rows])
             write_csv(self.market_file(self.update, stock), [MARKET_HEADER])
         result = self.run_command(1)
-        self.assertIn("provisional GRU defaults", result.stderr)
+        self.assertNotIn("provisional GRU defaults", result.stderr)
         metadata = json.loads((self.artifacts / "metadata.json").read_text())
-        self.assertEqual(metadata["configuration_status"], "provisional_default")
+        self.assertEqual(metadata["configuration_status"], "selected_default")
+        self.assertEqual(metadata["epoch_source"], "validation")
+        self.assertEqual(metadata["epoch_selection"], frozen["epoch_selection"])
+        self.assertEqual(metadata["config"]["epochs"], frozen["epochs"])
+        self.assertEqual(metadata["deployment_seeds"], frozen["deployment_seeds"])
         self.assertEqual(len(set(metadata["deployment_seeds"])), 5)
-        self.assertEqual(self.predict("2026-05-25")[0], ["id", "2026-05-25"])
+        prediction_date = (start + timedelta(days=days)).isoformat()
+        self.assertEqual(self.predict(prediction_date)[0], ["id", prediction_date])
 
     def test_training_on_universe_writes_template_order_for_both_phases(self):
         metadata = self.train()
