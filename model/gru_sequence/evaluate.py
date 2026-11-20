@@ -104,6 +104,7 @@ def _score(models, history, config, dates, target_positions):
     for model in models:
         model.eval()
     rows = []
+    all_market_stale_dates = []
     for day in dates:
         realized = history.realized_returns(day, target_positions)
         if not realized:
@@ -111,8 +112,11 @@ def _score(models, history, config, dates, target_positions):
         # The prediction mask is causal: realized labels never decide which stocks enter attention.
         batch = history.batch(day, config.window_length)
         if batch.all_market_stale:
-            raise ValueError(f"{day}: all universe stocks have stale market data")
-        scores = mean_f(models, batch).tolist()
+            # Offline scoring keeps labeled dates even when live prediction would abort.
+            all_market_stale_dates.append(day.isoformat())
+            scores = [0.0] * len(history.stock_ids)
+        else:
+            scores = mean_f(models, batch).tolist()
         for i, intraday_return in realized.items():
             f = scores[i]
             if not math.isfinite(f) or not math.isfinite(intraday_return):
@@ -124,7 +128,8 @@ def _score(models, history, config, dates, target_positions):
     always_up = math.fsum(row["intraday_return"] for row in rows) / len(rows)
     contest_score = math.fsum((2 * row["direction"] - 1) * row["intraday_return"] for row in rows) / len(rows)
     return {"row_count": len(rows), "contest_score": contest_score,
-            "always_up": always_up, "always_down": -always_up}, rows
+            "always_up": always_up, "always_down": -always_up,
+            "all_market_stale_dates": all_market_stale_dates}, rows
 
 
 def refit_epoch_count(fold_epochs):
