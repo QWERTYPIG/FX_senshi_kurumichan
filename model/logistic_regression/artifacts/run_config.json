@@ -1,0 +1,11 @@
+{
+  "source_directories": [
+    "data",
+    "newdata2/data"
+  ],
+  "train_end": "2026-11-20",
+  "validation_start": "2026-09-01",
+  "prediction_date": "2026-11-23",
+  "submission": "submission_2026-11-23_retrained.csv",
+  "details": "predictions_2026-11-23_retrained.csv"
+}

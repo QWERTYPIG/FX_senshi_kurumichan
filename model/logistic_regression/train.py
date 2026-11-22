@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 from common import ROOT, DATA_DIR, BASIC_DATA_DIR, MODEL_DIR, read_template, encode
-from features import build_data, fit, predict, metrics
+from features import build_data, load_history, fit, predict, metrics
 
 
 def main():
@@ -17,7 +17,8 @@ def main():
                         help='Original history (MANAGER_BASIC_DATA_DIR); merged with recent data in memory')
     parser.add_argument('--stock-template', type=Path, default=ROOT / 'model/all_down/all_down.csv')
     parser.add_argument('--artifacts-dir', type=Path, default=MODEL_DIR / 'artifacts')
-    parser.add_argument('--train-end', default='2026-05-31', help='Inclusive label cutoff; default preserves Phase 1 holdout')
+    parser.add_argument('--train-end', default='2026-05-31',
+                        help='Inclusive label cutoff or latest for all available valid labels; default preserves Phase 1 holdout')
     parser.add_argument('--validation-start', default='2026-01-01')
     parser.add_argument('--penalties', type=float, nargs='+', default=[1e-6,1e-5,1e-4,.001,.01,.1,1,10,100])
     parser.add_argument('--half-lives', type=float, nargs='+', default=[0, 63, 126, 252],
@@ -28,11 +29,22 @@ def main():
     if any(not np.isfinite(p) or p <= 0 for p in args.penalties):
         parser.error('Penalties must be finite and positive')
     ids = read_template(args.stock_template).id.tolist()
-    cutoff = pd.Timestamp(args.train_end)
-    template = pd.DataFrame({'id':ids, cutoff.strftime('%Y-%m-%d'):0})
     history_dir = args.basic_data_dir if args.basic_data_dir is not None else args.data_dir
     update_dir = (args.data_dir if args.basic_data_dir is not None
                   and args.data_dir.resolve() != history_dir.resolve() else None)
+    if args.train_end == 'latest':
+        latest_dates = []
+        for sid in ids:
+            history = load_history(history_dir, update_dir, Path('market') / f'{sid}.csv', pd.Timestamp.max)
+            valid = history[(history['etl:adj_open'] > 0) & (history['etl:adj_close'] > 0)]
+            if not valid.empty:
+                latest_dates.append(valid.index.max())
+        if not latest_dates:
+            raise ValueError('No valid price history for training')
+        cutoff = max(latest_dates)
+    else:
+        cutoff = pd.Timestamp(args.train_end)
+    template = pd.DataFrame({'id':ids, cutoff.strftime('%Y-%m-%d'):0})
     panel = build_data(history_dir, template, update_dir=update_dir)
     features = encode(panel, ids)
     train = panel[panel.target.notna() & panel.stock_source_date.notna() & (panel.date <= cutoff)]

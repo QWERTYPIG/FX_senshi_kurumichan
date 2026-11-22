@@ -1,2 +1,2 @@
 python predict.py
-python train.py
+python train.py --train-end latest --validation-start 2026-09-01

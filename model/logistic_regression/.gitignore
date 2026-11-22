@@ -3,6 +3,7 @@ artifacts/*
 !artifacts/metadata.json
 !artifacts/metrics.json
 !artifacts/regularization_search.csv
+!artifacts/run_config.json
 prediction.csv
 predictions.csv
 __pycache__/
